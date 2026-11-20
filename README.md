@@ -69,7 +69,7 @@ model=deepseek-chat
 workdir=C:\xpcode-demo
 ```
 
-Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services. Relative tool paths resolve against `workdir`.
+Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services. Relative tool paths resolve against `workdir`. In the app, `Ctrl+N` starts a new chat and `Ctrl+O` picks the project folder.
 
 Proxy:
 

@@ -17,6 +17,8 @@
 #define IDM_EXIT 2001
 #define IDM_SETTINGS 2002
 #define IDM_ABOUT 2003
+#define IDM_NEW 2004
+#define IDM_WORKDIR 2005
 
 #define WM_APP_CHUNK (WM_APP + 1)
 #define WM_APP_DONE (WM_APP + 2)
@@ -1150,8 +1152,11 @@ static HMENU build_menu(void)
 	HMENU settings = CreatePopupMenu();
 	HMENU help = CreatePopupMenu();
 
+	AppendMenuA(file, MF_STRING, IDM_NEW, "&New Chat");
+	AppendMenuA(file, MF_SEPARATOR, 0, NULL);
 	AppendMenuA(file, MF_STRING, IDM_EXIT, "E&xit");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)file, "&File");
+	AppendMenuA(settings, MF_STRING, IDM_WORKDIR, "Choose &Working Folder...");
 	AppendMenuA(settings, MF_STRING, IDM_SETTINGS, "&Open Settings File");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)settings, "&Settings");
 	AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About");
@@ -1165,6 +1170,45 @@ static void open_settings(void)
 
 	get_ini_path(path);
 	ShellExecuteA(g_hwnd, "open", "notepad.exe", path, NULL, SW_SHOW);
+}
+
+static void new_chat(void)
+{
+	if (g_busy)
+		return;
+	SetWindowTextW(g_transcript, L"");
+	sb_free(&g_reply);
+	sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
+		(unsigned long)GetTickCount());
+	set_status("New chat");
+	SetFocus(g_input);
+}
+
+static void choose_workdir(void)
+{
+	BROWSEINFOA bi;
+	LPITEMIDLIST pidl;
+	char path[MAX_PATH];
+	char ini[MAX_PATH];
+
+	if (g_busy)
+		return;
+	memset(&bi, 0, sizeof bi);
+	bi.hwndOwner = g_hwnd;
+	bi.lpszTitle = "Choose the XPCode project folder";
+	bi.ulFlags = BIF_RETURNONLYFSDIRS;
+	pidl = SHBrowseForFolderA(&bi);
+	if (!pidl)
+		return;
+	if (SHGetPathFromIDListA(pidl, path)) {
+		strncpy(g_workdir, path, sizeof g_workdir - 1);
+		g_workdir[sizeof g_workdir - 1] = 0;
+		get_ini_path(ini);
+		WritePrivateProfileStringA("server", "workdir", g_workdir, ini);
+		new_chat();
+		set_status(g_workdir);
+	}
+	ILFree(pidl);
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1229,6 +1273,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		switch (LOWORD(wParam)) {
 		case IDC_SEND:
 			do_send();
+			return 0;
+		case IDM_NEW:
+			new_chat();
+			return 0;
+		case IDM_WORKDIR:
+			choose_workdir();
 			return 0;
 		case IDM_EXIT:
 			DestroyWindow(hwnd);
@@ -1299,6 +1349,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	WNDCLASSA wc;
 	MSG msg;
 	RECT wa;
+	ACCEL acc[2];
+	HACCEL accel;
 	int ww = 760, wh = 560, wx, wy;
 
 	(void)prev;
@@ -1338,9 +1390,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 		do_send();
 	}
 
+	acc[0].fVirt = FVIRTKEY | FCONTROL;
+	acc[0].key = 'N';
+	acc[0].cmd = IDM_NEW;
+	acc[1].fVirt = FVIRTKEY | FCONTROL;
+	acc[1].key = 'O';
+	acc[1].cmd = IDM_WORKDIR;
+	accel = CreateAcceleratorTableA(acc, 2);
+
 	while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-		TranslateMessage(&msg);
-		DispatchMessageA(&msg);
+		if (!TranslateAcceleratorA(g_hwnd, accel, &msg)) {
+			TranslateMessage(&msg);
+			DispatchMessageA(&msg);
+		}
 	}
 	return (int)msg.wParam;
 }
