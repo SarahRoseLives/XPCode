@@ -6,6 +6,7 @@
 #include <wininet.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <richedit.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -244,10 +245,11 @@ static void set_status(const char *s)
 	SetWindowTextA(g_status, s);
 }
 
-static void transcript_append(const char *s)
+static void transcript_append_styled(const char *s, COLORREF color, int bold)
 {
-	int wl, len;
+	int wl, start, end;
 	wchar_t *w;
+	CHARFORMAT2W cf;
 
 	if (!s)
 		return;
@@ -260,12 +262,28 @@ static void transcript_append(const char *s)
 	MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wl);
 
 	SendMessageW(g_transcript, EM_SETREADONLY, FALSE, 0);
-	len = GetWindowTextLengthW(g_transcript);
-	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+	start = GetWindowTextLengthW(g_transcript);
+	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)start, (LPARAM)start);
 	SendMessageW(g_transcript, EM_REPLACESEL, FALSE, (LPARAM)w);
+	end = GetWindowTextLengthW(g_transcript);
+	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)start, (LPARAM)end);
+
+	memset(&cf, 0, sizeof cf);
+	cf.cbSize = sizeof cf;
+	cf.dwMask = CFM_COLOR | CFM_BOLD;
+	cf.crTextColor = color;
+	cf.dwEffects = bold ? CFE_BOLD : 0;
+	SendMessageW(g_transcript, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+
+	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)end, (LPARAM)end);
 	SendMessageW(g_transcript, EM_SCROLLCARET, 0, 0);
 	SendMessageW(g_transcript, EM_SETREADONLY, TRUE, 0);
 	free(w);
+}
+
+static void transcript_append(const char *s)
+{
+	transcript_append_styled(s, RGB(0, 0, 0), 0);
 }
 
 static int read_exact(HINTERNET h, char *buf, DWORD n)
@@ -952,6 +970,11 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 		post_wininet_error(hwnd, "HttpOpenRequest failed");
 		goto out;
 	}
+	{
+		DWORD rto = 120000;
+		InternetSetOptionA(req, INTERNET_OPTION_RECEIVE_TIMEOUT, &rto, sizeof rto);
+		InternetSetOptionA(req, INTERNET_OPTION_SEND_TIMEOUT, &rto, sizeof rto);
+	}
 	if (!HttpSendRequestA(req, "Content-Type: application/json\r\n", -1,
 			      (LPVOID)body, (DWORD)strlen(body))) {
 		post_wininet_error(hwnd, "HTTP send failed");
@@ -1100,9 +1123,10 @@ static void do_send(void)
 	g_busy = 1;
 	EnableWindow(g_send, FALSE);
 	SetWindowTextA(g_input, "");
-	transcript_append("You: ");
+	transcript_append_styled("You: ", RGB(0, 0, 180), 1);
 	transcript_append(text);
-	transcript_append("\r\n\r\nXPCode: ");
+	transcript_append("\r\n\r\n");
+	transcript_append_styled("XPCode: ", RGB(0, 128, 0), 1);
 	sb_free(&g_reply);
 	body = build_start_body(text);
 	set_status("Thinking...");
@@ -1307,16 +1331,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 	case WM_APP_LOG: {
 		char *s = (char *)lParam;
 		if (s) {
-			transcript_append(s);
+			transcript_append_styled(s, RGB(110, 110, 110), 0);
 			free(s);
 		}
 		return 0;
 	}
 	case WM_APP_ERROR: {
 		char *s = (char *)lParam;
-		transcript_append("\r\n[error] ");
+		transcript_append_styled("\r\n[error] ", RGB(180, 0, 0), 1);
 		if (s) {
-			transcript_append(s);
+			transcript_append_styled(s, RGB(180, 0, 0), 0);
 			free(s);
 		}
 		set_status("Error");
