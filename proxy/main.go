@@ -728,7 +728,7 @@ func webSearchHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.2")
+	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.3")
 	hreq.Header.Set("Accept", "text/html")
 	resp, err := webClient.Do(hreq)
 	if err != nil {
@@ -786,7 +786,7 @@ func webFetchHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.2")
+	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.3")
 	resp, err := webClient.Do(hreq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -839,7 +839,7 @@ func webRawHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.2")
+	hreq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 5.1) XPCode/0.3")
 	resp, err := downloadClient.Do(hreq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)

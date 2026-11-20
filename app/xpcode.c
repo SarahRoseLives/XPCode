@@ -1262,7 +1262,7 @@ static int proxy_open(const char *api_path, const char *body,
 	*conn = NULL;
 	*req = NULL;
 	*status = 0;
-	in = InternetOpenA("XPCode/0.2", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+	in = InternetOpenA("XPCode/0.3", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
 	if (!in)
 		return -1;
 	co = InternetConnectA(in, g_host, (INTERNET_PORT)g_port, NULL, NULL,
@@ -1701,7 +1701,7 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 
 	*need_tools = 0;
 	PostMessageA(hwnd, WM_APP_STATUS, 0, (LPARAM)dupstr("Thinking..."));
-	inet = InternetOpenA("XPCode/0.2", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+	inet = InternetOpenA("XPCode/0.3", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
 	if (!inet) {
 		post_wininet_error(hwnd, "InternetOpen failed");
 		return -1;
@@ -2248,7 +2248,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 			return 0;
 		case IDM_ABOUT:
 			MessageBoxA(hwnd,
-				    "XPCode 0.2\n\nA native Windows XP AI coding client.\n\n"
+				    "XPCode 0.3\n\nA native Windows XP AI coding client.\n\n"
 				    "Streams over plain HTTP from the Go bridge and runs tools locally.",
 				    "About XPCode", MB_OK | MB_ICONINFORMATION);
 			return 0;
