@@ -81,10 +81,10 @@ xpproxy --upstream https://api.openai.com/v1/chat/completions --model gpt-4o-min
 
 ## Security
 
-The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`. It is never written into XPCode or committed to this repo. Keep the proxy off untrusted networks. Enable "Ask before running or editing tools" in Settings (or `approve=1`) to confirm each mutating tool call; it is off by default.
+The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`. It is never written into XPCode or committed to this repo. Keep the proxy off untrusted networks. Web pages are untrusted input; the agent is told not to follow instructions found in fetched content, but review its actions. Enable "Ask before running or editing tools" in Settings (or `approve=1`) to confirm each mutating tool call; it is off by default.
 
 ## Status
 
-Chat, streaming, and a local tool loop work end-to-end on Windows XP. The default model is `deepseek-flash` (DeepSeek-V4.1-Flash). The model can call `read_file`, `write_file`, `edit_file`, `apply_patch`, `make_dir`, `list_dir`, `glob`, `search`, and `run_command`; XPCode executes them in the guest and feeds the results back. Relative paths resolve against `workdir`, `read_file` accepts optional `start`/`lines`, and `run_command` takes a timeout. The project tree is included in the system prompt, and file text is normalized between LF and CRLF.
+Chat, streaming, and a local tool loop work end-to-end on Windows XP. The default model is `deepseek-flash` (DeepSeek-V4.1-Flash). The model can call `read_file`, `write_file`, `edit_file`, `apply_patch`, `make_dir`, `list_dir`, `glob`, `search`, `web_search`, `web_fetch`, `download`, and `run_command`; XPCode executes them in the guest and feeds the results back. Relative paths resolve against `workdir`, `read_file` accepts optional `start`/`lines`, and `run_command` takes a timeout. The project tree is included in the system prompt, and file text is normalized between LF and CRLF. `web_search` uses DuckDuckGo, `web_fetch` returns readable page text, and `download` streams any http(s) file through the bridge and reports the byte count.
 
 Reasoning streams in gray italic under a `[thinking]` label, tool calls are teal, and the final answer is black. The transcript is UTF-8/Unicode safe and is appended to `xpcode.log` next to the executable. Tools run with the XP user's privileges, so only use this on a machine and with prompts you trust.

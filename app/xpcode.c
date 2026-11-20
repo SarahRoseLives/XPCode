@@ -1250,11 +1250,212 @@ static char *tool_apply_patch(const char *path, ToolCall *tc)
 	}
 }
 
+static int proxy_open(const char *api_path, const char *body,
+		      HINTERNET *inet, HINTERNET *conn, HINTERNET *req, DWORD *status)
+{
+	HINTERNET in, co, re;
+	DWORD sz;
+	DWORD rto = 120000;
+
+	*inet = NULL;
+	*conn = NULL;
+	*req = NULL;
+	*status = 0;
+	in = InternetOpenA("XPCode/0.2", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+	if (!in)
+		return -1;
+	co = InternetConnectA(in, g_host, (INTERNET_PORT)g_port, NULL, NULL,
+			      INTERNET_SERVICE_HTTP, 0, 0);
+	if (!co) {
+		InternetCloseHandle(in);
+		return -1;
+	}
+	re = HttpOpenRequestA(co, "POST", api_path, NULL, NULL, NULL,
+			      INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
+	if (!re) {
+		InternetCloseHandle(co);
+		InternetCloseHandle(in);
+		return -1;
+	}
+	InternetSetOptionA(re, INTERNET_OPTION_RECEIVE_TIMEOUT, &rto, sizeof rto);
+	InternetSetOptionA(re, INTERNET_OPTION_SEND_TIMEOUT, &rto, sizeof rto);
+	if (!HttpSendRequestA(re, "Content-Type: application/json\r\n", -1,
+			      (LPVOID)body, (DWORD)strlen(body))) {
+		InternetCloseHandle(re);
+		InternetCloseHandle(co);
+		InternetCloseHandle(in);
+		return -1;
+	}
+	sz = sizeof *status;
+	HttpQueryInfoA(re, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, status, &sz, NULL);
+	*inet = in;
+	*conn = co;
+	*req = re;
+	return 0;
+}
+
+static char *proxy_post_text(const char *api_path, const char *body, int *status)
+{
+	HINTERNET inet, conn, req;
+	DWORD code = 0, got = 0;
+	SB out = {0};
+	char tmp[4096];
+
+	if (status)
+		*status = 0;
+	if (proxy_open(api_path, body, &inet, &conn, &req, &code) != 0) {
+		if (status)
+			*status = -1;
+		return dupstr("error: cannot reach proxy");
+	}
+	if (status)
+		*status = (int)code;
+	while (InternetReadFile(req, tmp, sizeof tmp, &got) && got > 0) {
+		sb_add(&out, tmp, got);
+		if (out.len > 256 * 1024)
+			break;
+	}
+	InternetCloseHandle(req);
+	InternetCloseHandle(conn);
+	InternetCloseHandle(inet);
+	return out.p ? out.p : dupstr("");
+}
+
+static char *tool_web_search(const char *query, int max)
+{
+	SB b = {0};
+	char m[32];
+	int status = 0;
+	char *res;
+
+	if (!query || !*query)
+		return dupstr("error: query is required");
+	sb_str(&b, "{\"query\":");
+	sb_json(&b, query);
+	sprintf(m, ",\"max\":%d}", max);
+	sb_str(&b, m);
+	res = proxy_post_text("/web/search", b.p, &status);
+	sb_free(&b);
+	if (!res)
+		return dupstr("error: out of memory");
+	if (status != 200) {
+		SB e = {0};
+		sb_str(&e, "error: web search failed");
+		if (*res) {
+			sb_str(&e, ": ");
+			sb_str(&e, res);
+		}
+		free(res);
+		return e.p;
+	}
+	return res;
+}
+
+static char *tool_web_fetch(const char *url, int max)
+{
+	SB b = {0};
+	char m[32];
+	int status = 0;
+	char *res;
+
+	if (!url || !*url)
+		return dupstr("error: url is required");
+	sb_str(&b, "{\"url\":");
+	sb_json(&b, url);
+	sprintf(m, ",\"max\":%d}", max);
+	sb_str(&b, m);
+	res = proxy_post_text("/web/fetch", b.p, &status);
+	sb_free(&b);
+	if (!res)
+		return dupstr("error: out of memory");
+	if (status != 200) {
+		SB e = {0};
+		sb_str(&e, "error: web fetch failed");
+		if (*res) {
+			sb_str(&e, ": ");
+			sb_str(&e, res);
+		}
+		free(res);
+		return e.p;
+	}
+	return res;
+}
+
+static char *tool_web_download(const char *url, const char *dest)
+{
+	SB b = {0};
+	SB err = {0};
+	HINTERNET inet, conn, req;
+	DWORD code = 0, got = 0;
+	HANDLE h;
+	char tmp[8192];
+	DWORD wrote, total = 0;
+	int failed = 0;
+	char msg[512];
+
+	if (!url || !*url)
+		return dupstr("error: url is required");
+	sb_str(&b, "{\"url\":");
+	sb_json(&b, url);
+	sb_str(&b, "}");
+	if (proxy_open("/web/raw", b.p, &inet, &conn, &req, &code) != 0) {
+		sb_free(&b);
+		return dupstr("error: cannot reach proxy");
+	}
+	sb_free(&b);
+	if (code != 200) {
+		while (InternetReadFile(req, tmp, sizeof tmp, &got) && got > 0)
+			sb_add(&err, tmp, got);
+		InternetCloseHandle(req);
+		InternetCloseHandle(conn);
+		InternetCloseHandle(inet);
+		sprintf(msg, "error: download failed (HTTP %lu) %.400s",
+			(unsigned long)code, err.p ? err.p : "");
+		sb_free(&err);
+		return dupstr(msg);
+	}
+	h = CreateFileA(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		InternetCloseHandle(req);
+		InternetCloseHandle(conn);
+		InternetCloseHandle(inet);
+		return dupstr("error: cannot create destination file");
+	}
+	for (;;) {
+		if (!InternetReadFile(req, tmp, sizeof tmp, &got)) {
+			failed = 1;
+			break;
+		}
+		if (got == 0)
+			break;
+		if (!WriteFile(h, tmp, got, &wrote, NULL)) {
+			failed = 1;
+			break;
+		}
+		total += wrote;
+		if (total > 128 * 1024 * 1024) {
+			failed = 1;
+			break;
+		}
+	}
+	CloseHandle(h);
+	InternetCloseHandle(req);
+	InternetCloseHandle(conn);
+	InternetCloseHandle(inet);
+	if (failed) {
+		DeleteFileA(dest);
+		return dupstr("error: download interrupted");
+	}
+	sprintf(msg, "downloaded %lu bytes to %s", (unsigned long)total, dest);
+	return dupstr(msg);
+}
+
 static int needs_approval(const char *name)
 {
 	return !strcmp(name, "write_file") || !strcmp(name, "edit_file") ||
 	       !strcmp(name, "apply_patch") || !strcmp(name, "make_dir") ||
-	       !strcmp(name, "run_command");
+	       !strcmp(name, "run_command") || !strcmp(name, "download");
 }
 
 static void approval_text(ToolCall *tc, char *out, size_t cap)
@@ -1280,6 +1481,28 @@ static char *execute_tool(ToolCall *tc)
 			return dupstr("denied by user");
 	}
 
+	if (!strcmp(tc->name, "web_search")) {
+		const char *mp = arg_of(tc, "max");
+		int max = *mp ? atoi(mp) : 5;
+		if (max < 1)
+			max = 5;
+		if (max > 10)
+			max = 10;
+		return tool_web_search(arg_of(tc, "query"), max);
+	}
+	if (!strcmp(tc->name, "web_fetch")) {
+		const char *mp = arg_of(tc, "max");
+		int max = *mp ? atoi(mp) : 20000;
+		if (max < 1000)
+			max = 20000;
+		if (max > 200000)
+			max = 200000;
+		return tool_web_fetch(arg_of(tc, "url"), max);
+	}
+	if (!strcmp(tc->name, "download")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_web_download(arg_of(tc, "url"), path);
+	}
 	if (!strcmp(tc->name, "read_file")) {
 		const char *ss = arg_of(tc, "start");
 		const char *ls = arg_of(tc, "lines");
