@@ -627,6 +627,7 @@ static char *tool_run_command(const char *command, int timeout_sec)
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	DWORD wrote = 0, code = 0, size = 0, off = 0, got = 0;
+	DWORD fullsize = 0;
 	DWORD wait;
 	LONG deadline;
 	int timed_out;
@@ -717,6 +718,7 @@ static char *tool_run_command(const char *command, int timeout_sec)
 			 NULL, OPEN_EXISTING, 0, NULL);
 	if (hr != INVALID_HANDLE_VALUE) {
 		size = GetFileSize(hr, NULL);
+		fullsize = size;
 		if (size == INVALID_FILE_SIZE || size > 256 * 1024)
 			size = 256 * 1024;
 		body = (char *)malloc((size_t)size + 1);
@@ -735,6 +737,8 @@ static char *tool_run_command(const char *command, int timeout_sec)
 	sprintf(head, "exit=%lu\r\n", (unsigned long)code);
 	sb_str(&b, head);
 	sb_str(&b, body ? body : "");
+	if (fullsize != INVALID_FILE_SIZE && fullsize > 256 * 1024)
+		sb_str(&b, "\r\n[output truncated]");
 	if (cancelled) {
 		sb_str(&b, "\r\n[cancelled]");
 	} else if (timed_out) {
@@ -1082,7 +1086,13 @@ static char *execute_and_build(ToolList *tl, HWND hwnd)
 	for (i = 0; i < tl->n; i++) {
 		char *res;
 		char logline[512];
-		sprintf(logline, "\r\n[tool] %s\r\n", tl->items[i].name ? tl->items[i].name : "?");
+		const char *detail = arg_of(&tl->items[i], "path");
+		if (!*detail)
+			detail = arg_of(&tl->items[i], "command");
+		if (!*detail)
+			detail = arg_of(&tl->items[i], "pattern");
+		snprintf(logline, sizeof logline, "\r\n[tool] %s %.100s\r\n",
+			 tl->items[i].name ? tl->items[i].name : "?", detail);
 		PostMessageA(hwnd, WM_APP_LOG, 0, (LPARAM)dupstr(logline));
 		res = execute_tool(&tl->items[i]);
 		if (i)
