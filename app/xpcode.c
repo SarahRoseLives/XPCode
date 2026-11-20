@@ -26,6 +26,7 @@
 #define IDM_WORKDIR 2005
 #define IDM_SETTINGS_FILE 2006
 #define IDM_LOG 2007
+#define IDM_CONTINUE 2008
 
 #define WM_APP_CHUNK (WM_APP + 1)
 #define WM_APP_DONE (WM_APP + 2)
@@ -35,7 +36,7 @@
 #define WM_APP_REASON (WM_APP + 6)
 
 #define MAX_FRAME (64L * 1024 * 1024)
-#define MAX_TOOL_ROUNDS 40
+#define MAX_TOOL_ROUNDS 80
 
 typedef struct {
 	char *p;
@@ -1451,6 +1452,69 @@ static char *tool_web_download(const char *url, const char *dest)
 	return dupstr(msg);
 }
 
+typedef struct {
+	const char *question;
+	char answer[1024];
+	int ok;
+} AskCtx;
+
+static INT_PTR CALLBACK ask_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	AskCtx *ctx = (AskCtx *)GetWindowLongPtrA(dlg, GWLP_USERDATA);
+
+	switch (msg) {
+	case WM_INITDIALOG:
+		ctx = (AskCtx *)lParam;
+		SetWindowLongPtrA(dlg, GWLP_USERDATA, (LONG_PTR)ctx);
+		SetDlgItemTextA(dlg, IDC_ASK_QUESTION, ctx->question ? ctx->question : "");
+		SetDlgItemTextA(dlg, IDC_ASK_ANSWER, "");
+		SetFocus(GetDlgItem(dlg, IDC_ASK_ANSWER));
+		return FALSE;
+	case WM_COMMAND:
+		if (!ctx)
+			break;
+		switch (LOWORD(wParam)) {
+		case IDC_ASK_OK:
+			GetDlgItemTextA(dlg, IDC_ASK_ANSWER, ctx->answer, sizeof ctx->answer);
+			ctx->ok = 1;
+			EndDialog(dlg, 1);
+			return TRUE;
+		case IDC_ASK_CANCEL:
+			ctx->ok = 0;
+			EndDialog(dlg, 0);
+			return TRUE;
+		}
+		break;
+	case WM_CLOSE:
+		if (ctx)
+			ctx->ok = 0;
+		EndDialog(dlg, 0);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static char *tool_ask_user(const char *question)
+{
+	AskCtx ctx;
+	INT_PTR r;
+	char log[1200];
+
+	memset(&ctx, 0, sizeof ctx);
+	ctx.question = question;
+	r = DialogBoxParamA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDD_ASK),
+			    g_hwnd, ask_proc, (LPARAM)&ctx);
+	if (r == 1) {
+		snprintf(log, sizeof log, "\r\n[answer] %.900s\r\n", ctx.answer);
+		PostMessageA(g_hwnd, WM_APP_LOG, 0, (LPARAM)dupstr(log));
+		if (ctx.answer[0] == 0)
+			return dupstr("(the user sent an empty answer)");
+		return dupstr(ctx.answer);
+	}
+	PostMessageA(g_hwnd, WM_APP_LOG, 0, (LPARAM)dupstr("\r\n[answer] (canceled)\r\n"));
+	return dupstr("(the user canceled the question)");
+}
+
 static int needs_approval(const char *name)
 {
 	return !strcmp(name, "write_file") || !strcmp(name, "edit_file") ||
@@ -1503,6 +1567,8 @@ static char *execute_tool(ToolCall *tc)
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
 		return tool_web_download(arg_of(tc, "url"), path);
 	}
+	if (!strcmp(tc->name, "ask_user"))
+		return tool_ask_user(arg_of(tc, "question"));
 	if (!strcmp(tc->name, "read_file")) {
 		const char *ss = arg_of(tc, "start");
 		const char *ls = arg_of(tc, "lines");
@@ -1808,6 +1874,16 @@ static DWORD WINAPI net_thread(LPVOID param)
 	return 0;
 }
 
+static void do_send(void);
+
+static void do_continue(void)
+{
+	if (g_busy)
+		return;
+	SetWindowTextA(g_input, "Continue with the task. Do not stop until it is complete; use tools, or use ask_user if you need input.");
+	do_send();
+}
+
 static void do_stop(void)
 {
 	if (!g_busy)
@@ -1895,6 +1971,7 @@ static HMENU build_menu(void)
 	HMENU help = CreatePopupMenu();
 
 	AppendMenuA(file, MF_STRING, IDM_NEW, "&New Chat");
+	AppendMenuA(file, MF_STRING, IDM_CONTINUE, "&Continue\tF5");
 	AppendMenuA(file, MF_SEPARATOR, 0, NULL);
 	AppendMenuA(file, MF_STRING, IDM_EXIT, "E&xit");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)file, "&File");
@@ -2151,6 +2228,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		case IDM_NEW:
 			new_chat();
 			return 0;
+		case IDM_CONTINUE:
+			do_continue();
+			return 0;
 		case IDM_SETTINGS:
 			show_settings();
 			return 0;
@@ -2253,7 +2333,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	WNDCLASSA wc;
 	MSG msg;
 	RECT wa;
-	ACCEL acc[4];
+	ACCEL acc[5];
 	HACCEL accel;
 	int ww = 760, wh = 560, wx, wy;
 
@@ -2306,7 +2386,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	acc[3].fVirt = FVIRTKEY;
 	acc[3].key = VK_ESCAPE;
 	acc[3].cmd = IDC_STOP;
-	accel = CreateAcceleratorTableA(acc, 4);
+	acc[4].fVirt = FVIRTKEY;
+	acc[4].key = VK_F5;
+	acc[4].cmd = IDM_CONTINUE;
+	accel = CreateAcceleratorTableA(acc, 5);
 
 	while (GetMessageA(&msg, NULL, 0, 0) > 0) {
 		if (!TranslateAcceleratorA(g_hwnd, accel, &msg)) {

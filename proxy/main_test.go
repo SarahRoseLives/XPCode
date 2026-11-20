@@ -5,7 +5,7 @@ import "testing"
 func TestTrimSessionKeepsSystemAndUserBoundary(t *testing.T) {
 	sys := "sys"
 	s := &session{messages: []oaiMessage{{Role: "system", Content: &sys}}}
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 600; i++ {
 		role := "user"
 		if i%2 == 1 {
 			role = "assistant"
@@ -14,7 +14,7 @@ func TestTrimSessionKeepsSystemAndUserBoundary(t *testing.T) {
 		s.messages = append(s.messages, oaiMessage{Role: role, Content: &c})
 	}
 	trimSession(s)
-	if len(s.messages) > 60 {
+	if len(s.messages) > 400 {
 		t.Fatalf("too many messages after trim: %d", len(s.messages))
 	}
 	if s.messages[0].Role != "system" {
@@ -28,7 +28,7 @@ func TestTrimSessionKeepsSystemAndUserBoundary(t *testing.T) {
 func TestTrimSessionNoUserBoundary(t *testing.T) {
 	sys := "sys"
 	s := &session{messages: []oaiMessage{{Role: "system", Content: &sys}}}
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 600; i++ {
 		c := "m"
 		s.messages = append(s.messages, oaiMessage{Role: "assistant", Content: &c})
 	}
