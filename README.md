@@ -16,6 +16,8 @@ Windows XP                        Host (Linux/macOS)
 
 XP only speaks TLS 1.0, so it never calls the provider directly. The bridge streams replies back as tiny length-prefixed frames, which keeps the XP side simple. `--mock` streams canned replies for offline UI work.
 
+Tool calls arrive as `T` frames, XPCode executes them in the guest, and the results are posted back for the next round.
+
 ## Layout
 
 - `app/` — native Win32 client (C, MinGW)
@@ -82,4 +84,6 @@ The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPE
 
 ## Status
 
-Chat and streaming work end-to-end on Windows XP. Coding tools (`read_file`, `write_file`, `list_dir`, `run_command`) are next.
+Chat, streaming, and a local tool loop work end-to-end on Windows XP. The model can call `read_file`, `write_file`, `list_dir`, and `run_command`; XPCode executes them in the guest and feeds the results back.
+
+Tools run with the XP user's privileges, so only use this on a machine and with prompts you trust.

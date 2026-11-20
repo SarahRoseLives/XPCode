@@ -20,14 +20,10 @@
 #define WM_APP_CHUNK (WM_APP + 1)
 #define WM_APP_DONE (WM_APP + 2)
 #define WM_APP_ERROR (WM_APP + 3)
+#define WM_APP_LOG (WM_APP + 4)
 
-#define MAX_HISTORY 64
 #define MAX_FRAME (64L * 1024 * 1024)
-
-typedef struct {
-	char *role;
-	char *content;
-} Msg;
+#define MAX_TOOL_ROUNDS 8
 
 typedef struct {
 	char *p;
@@ -40,6 +36,29 @@ typedef struct {
 	char *body;
 } Job;
 
+typedef struct {
+	char *k;
+	char *v;
+} KV;
+
+typedef struct {
+	char *id;
+	char *name;
+	KV *args;
+	int nargs;
+} ToolCall;
+
+typedef struct {
+	ToolCall *items;
+	int n;
+} ToolList;
+
+typedef struct {
+	const char *p;
+	long len;
+	long off;
+} Cur;
+
 static HWND g_hwnd;
 static HWND g_transcript;
 static HWND g_input;
@@ -48,12 +67,11 @@ static HWND g_status;
 static HFONT g_font;
 static WNDPROC g_edit_proc;
 static int g_busy;
-static Msg g_msgs[MAX_HISTORY];
-static int g_nmsgs;
 static SB g_reply;
 static char g_host[128] = "Garden.lan";
 static int g_port = 8080;
 static char g_model[128] = "deepseek-chat";
+static char g_session[64];
 
 static char *dupstr(const char *s)
 {
@@ -140,40 +158,6 @@ static void sb_json(SB *b, const char *s)
 	sb_str(b, "\"");
 }
 
-static char *build_body(void)
-{
-	SB b = {0};
-	int i;
-
-	sb_str(&b, "{\"model\":");
-	sb_json(&b, g_model);
-	sb_str(&b, ",\"messages\":[");
-	for (i = 0; i < g_nmsgs; i++) {
-		if (i)
-			sb_str(&b, ",");
-		sb_str(&b, "{\"role\":");
-		sb_json(&b, g_msgs[i].role);
-		sb_str(&b, ",\"content\":");
-		sb_json(&b, g_msgs[i].content);
-		sb_str(&b, "}");
-	}
-	sb_str(&b, "]}");
-	return b.p;
-}
-
-static void push_msg(const char *role, const char *content)
-{
-	if (g_nmsgs >= MAX_HISTORY) {
-		free(g_msgs[0].role);
-		free(g_msgs[0].content);
-		memmove(&g_msgs[0], &g_msgs[1], sizeof(Msg) * (MAX_HISTORY - 1));
-		g_nmsgs = MAX_HISTORY - 1;
-	}
-	g_msgs[g_nmsgs].role = dupstr(role);
-	g_msgs[g_nmsgs].content = dupstr(content);
-	g_nmsgs++;
-}
-
 static void get_ini_path(char *buf)
 {
 	char exe[MAX_PATH];
@@ -258,34 +242,393 @@ static void post_wininet_error(HWND hwnd, const char *what)
 	post_error(hwnd, msg);
 }
 
-static DWORD WINAPI net_thread(LPVOID param)
+static int cur_line(Cur *c, long *v)
 {
-	Job *job = (Job *)param;
+	long start = c->off;
+	long n;
+	char tmp[32];
+
+	while (c->off < c->len && c->p[c->off] != '\n')
+		c->off++;
+	if (c->off >= c->len)
+		return -1;
+	n = c->off - start;
+	if (n > (long)sizeof tmp - 1)
+		n = (long)sizeof tmp - 1;
+	memcpy(tmp, c->p + start, (size_t)n);
+	tmp[n] = 0;
+	c->off++;
+	*v = atol(tmp);
+	return (*v < 0) ? -1 : 0;
+}
+
+static char *cur_blob(Cur *c, long n)
+{
+	char *s;
+
+	if (n < 0 || c->off + n > c->len)
+		return NULL;
+	s = (char *)malloc((size_t)n + 1);
+	if (!s)
+		return NULL;
+	memcpy(s, c->p + c->off, (size_t)n);
+	s[n] = 0;
+	c->off += n;
+	return s;
+}
+
+static void free_tool_call(ToolCall *tc)
+{
+	int i;
+
+	free(tc->id);
+	free(tc->name);
+	for (i = 0; i < tc->nargs; i++) {
+		free(tc->args[i].k);
+		free(tc->args[i].v);
+	}
+	free(tc->args);
+	memset(tc, 0, sizeof *tc);
+}
+
+static void free_tool_list(ToolList *tl)
+{
+	int i;
+
+	for (i = 0; i < tl->n; i++)
+		free_tool_call(&tl->items[i]);
+	free(tl->items);
+	tl->items = NULL;
+	tl->n = 0;
+}
+
+static int parse_tool_payload(const char *payload, long len, ToolCall *tc)
+{
+	Cur c;
+	long n, nargs;
+	int i;
+
+	memset(tc, 0, sizeof *tc);
+	c.p = payload;
+	c.len = len;
+	c.off = 0;
+	if (cur_line(&c, &n)) {
+		free_tool_call(tc);
+		return -1;
+	}
+	tc->id = cur_blob(&c, n);
+	if (cur_line(&c, &n)) {
+		free_tool_call(tc);
+		return -1;
+	}
+	tc->name = cur_blob(&c, n);
+	if (cur_line(&c, &nargs)) {
+		free_tool_call(tc);
+		return -1;
+	}
+	if (nargs < 0 || nargs > 64) {
+		free_tool_call(tc);
+		return -1;
+	}
+	tc->args = (KV *)calloc((size_t)nargs, sizeof(KV));
+	if (nargs > 0 && !tc->args) {
+		free_tool_call(tc);
+		return -1;
+	}
+	tc->nargs = (int)nargs;
+	for (i = 0; i < nargs; i++) {
+		if (cur_line(&c, &n)) {
+			free_tool_call(tc);
+			return -1;
+		}
+		tc->args[i].k = cur_blob(&c, n);
+		if (cur_line(&c, &n)) {
+			free_tool_call(tc);
+			return -1;
+		}
+		tc->args[i].v = cur_blob(&c, n);
+	}
+	if (!tc->id || !tc->name) {
+		free_tool_call(tc);
+		return -1;
+	}
+	return 0;
+}
+
+static const char *arg_of(ToolCall *tc, const char *key)
+{
+	int i;
+
+	for (i = 0; i < tc->nargs; i++) {
+		if (!strcmp(tc->args[i].k, key))
+			return tc->args[i].v ? tc->args[i].v : "";
+	}
+	return "";
+}
+
+static char *tool_read_file(const char *path)
+{
+	HANDLE h;
+	DWORD full, size, got = 0;
+	char *s;
+	const DWORD cap = 512 * 1024;
+
+	h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot open file");
+	full = GetFileSize(h, NULL);
+	if (full == INVALID_FILE_SIZE) {
+		CloseHandle(h);
+		return dupstr("error: cannot stat file");
+	}
+	size = full > cap ? cap : full;
+	s = (char *)malloc((size_t)size + 32);
+	if (!s) {
+		CloseHandle(h);
+		return dupstr("error: out of memory");
+	}
+	if (size > 0)
+		ReadFile(h, s, size, &got, NULL);
+	CloseHandle(h);
+	s[got] = 0;
+	if (full > cap)
+		strcpy(s + got, "\n[truncated]");
+	return s;
+}
+
+static char *tool_write_file(const char *path, const char *content)
+{
+	HANDLE h;
+	DWORD wrote = 0;
+	size_t len = strlen(content);
+
+	h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot open file for writing");
+	if (len > 0 && !WriteFile(h, content, (DWORD)len, &wrote, NULL)) {
+		CloseHandle(h);
+		return dupstr("error: write failed");
+	}
+	CloseHandle(h);
+	return dupstr("ok");
+}
+
+static char *tool_list_dir(const char *path)
+{
+	SB b = {0};
+	char pattern[MAX_PATH];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+	size_t n = strlen(path);
+
+	if (n == 0 || n >= MAX_PATH - 2)
+		return dupstr("error: bad path");
+	strcpy(pattern, path);
+	if (pattern[n - 1] != '\\' && pattern[n - 1] != '/')
+		strcat(pattern, "\\");
+	strcat(pattern, "*");
+	h = FindFirstFileA(pattern, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot list directory");
+	do {
+		char line[600];
+		if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+			continue;
+		sprintf(line, "%s%s\t%lu\r\n", fd.cFileName,
+			(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "\\" : "",
+			(unsigned long)fd.nFileSizeLow);
+		sb_str(&b, line);
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+	if (!b.p)
+		return dupstr("(empty)");
+	return b.p;
+}
+
+static char *tool_run_command(const char *command)
+{
+	char tmpdir[MAX_PATH], bat[MAX_PATH * 2], outp[MAX_PATH * 2];
+	DWORD tick = GetTickCount();
+	SECURITY_ATTRIBUTES sa;
+	HANDLE hf, hout, hr, nul;
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	DWORD wrote = 0, code = 0, size = 0, off = 0, got = 0;
+	char *body = NULL;
+	SB b = {0};
+	char head[64];
+
+	if (GetTempPathA(MAX_PATH, tmpdir) == 0)
+		return dupstr("error: no temp path");
+	sprintf(bat, "%sxpcode_%lu_%lu.bat", tmpdir,
+		(unsigned long)GetCurrentProcessId(), (unsigned long)tick);
+	sprintf(outp, "%sxpcode_%lu_%lu.out", tmpdir,
+		(unsigned long)GetCurrentProcessId(), (unsigned long)tick);
+
+	hf = CreateFileA(bat, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			 FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hf == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot write temp batch");
+	WriteFile(hf, "@echo off\r\n", 11, &wrote, NULL);
+	WriteFile(hf, command, (DWORD)strlen(command), &wrote, NULL);
+	WriteFile(hf, "\r\n", 2, &wrote, NULL);
+	CloseHandle(hf);
+
+	sa.nLength = sizeof sa;
+	sa.lpSecurityDescriptor = NULL;
+	sa.bInheritHandle = TRUE;
+	hout = CreateFileA(outp, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			   &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hout == INVALID_HANDLE_VALUE) {
+		DeleteFileA(bat);
+		return dupstr("error: cannot create temp output");
+	}
+	nul = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			  &sa, OPEN_EXISTING, 0, NULL);
+
+	memset(&si, 0, sizeof si);
+	si.cb = sizeof si;
+	si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	si.hStdOutput = hout;
+	si.hStdError = hout;
+	si.hStdInput = (nul == INVALID_HANDLE_VALUE) ? NULL : nul;
+
+	{
+		char cmdline[MAX_PATH * 2 + 32];
+		sprintf(cmdline, "cmd.exe /c \"%s\"", bat);
+		memset(&pi, 0, sizeof pi);
+		if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+				    NULL, NULL, &si, &pi)) {
+			CloseHandle(hout);
+			if (nul != INVALID_HANDLE_VALUE)
+				CloseHandle(nul);
+			DeleteFileA(bat);
+			DeleteFileA(outp);
+			return dupstr("error: CreateProcess failed");
+		}
+	}
+	CloseHandle(hout);
+	if (nul != INVALID_HANDLE_VALUE)
+		CloseHandle(nul);
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	DeleteFileA(bat);
+
+	hr = CreateFileA(outp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			 NULL, OPEN_EXISTING, 0, NULL);
+	if (hr != INVALID_HANDLE_VALUE) {
+		size = GetFileSize(hr, NULL);
+		if (size == INVALID_FILE_SIZE || size > 256 * 1024)
+			size = 256 * 1024;
+		body = (char *)malloc((size_t)size + 1);
+		if (body) {
+			while (off < size) {
+				if (!ReadFile(hr, body + off, size - off, &got, NULL) || got == 0)
+					break;
+				off += got;
+			}
+			body[off] = 0;
+		}
+		CloseHandle(hr);
+	}
+	DeleteFileA(outp);
+
+	sprintf(head, "exit=%lu\r\n", (unsigned long)code);
+	sb_str(&b, head);
+	sb_str(&b, body ? body : "");
+	free(body);
+	return b.p ? b.p : dupstr("");
+}
+
+static char *execute_tool(ToolCall *tc)
+{
+	if (!strcmp(tc->name, "read_file"))
+		return tool_read_file(arg_of(tc, "path"));
+	if (!strcmp(tc->name, "write_file"))
+		return tool_write_file(arg_of(tc, "path"), arg_of(tc, "content"));
+	if (!strcmp(tc->name, "list_dir"))
+		return tool_list_dir(arg_of(tc, "path"));
+	if (!strcmp(tc->name, "run_command"))
+		return tool_run_command(arg_of(tc, "command"));
+	return dupstr("error: unknown tool");
+}
+
+static char *build_start_body(const char *text)
+{
+	SB b = {0};
+
+	sb_str(&b, "{\"session\":");
+	sb_json(&b, g_session);
+	sb_str(&b, ",\"model\":");
+	sb_json(&b, g_model);
+	sb_str(&b, ",\"message\":");
+	sb_json(&b, text);
+	sb_str(&b, "}");
+	return b.p;
+}
+
+static char *execute_and_build(ToolList *tl, HWND hwnd)
+{
+	SB b = {0};
+	int i;
+
+	sb_str(&b, "{\"session\":");
+	sb_json(&b, g_session);
+	sb_str(&b, ",\"model\":");
+	sb_json(&b, g_model);
+	sb_str(&b, ",\"tool_results\":[");
+	for (i = 0; i < tl->n; i++) {
+		char *res;
+		char logline[512];
+		sprintf(logline, "\r\n[tool] %s\r\n", tl->items[i].name ? tl->items[i].name : "?");
+		PostMessageA(hwnd, WM_APP_LOG, 0, (LPARAM)dupstr(logline));
+		res = execute_tool(&tl->items[i]);
+		if (i)
+			sb_str(&b, ",");
+		sb_str(&b, "{\"id\":");
+		sb_json(&b, tl->items[i].id ? tl->items[i].id : "");
+		sb_str(&b, ",\"content\":");
+		sb_json(&b, res ? res : "");
+		sb_str(&b, "}");
+		free(res);
+	}
+	sb_str(&b, "]}");
+	return b.p;
+}
+
+static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
+{
 	HINTERNET inet = NULL, conn = NULL, req = NULL;
 	DWORD status = 0, sz;
-	int done = 0;
+	int ok = -1;
 
-	inet = InternetOpenA("XPCode/0.1", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+	*need_tools = 0;
+	inet = InternetOpenA("XPCode/0.2", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
 	if (!inet) {
-		post_error(job->hwnd, "InternetOpen failed");
-		goto finish;
+		post_wininet_error(hwnd, "InternetOpen failed");
+		return -1;
 	}
 	conn = InternetConnectA(inet, g_host, (INTERNET_PORT)g_port, NULL, NULL,
 				INTERNET_SERVICE_HTTP, 0, 0);
 	if (!conn) {
-		post_wininet_error(job->hwnd, "cannot reach proxy");
-		goto finish;
+		post_wininet_error(hwnd, "cannot reach proxy");
+		goto out;
 	}
 	req = HttpOpenRequestA(conn, "POST", "/api/chat", NULL, NULL, NULL,
 			       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
 	if (!req) {
-		post_error(job->hwnd, "HttpOpenRequest failed");
-		goto finish;
+		post_wininet_error(hwnd, "HttpOpenRequest failed");
+		goto out;
 	}
 	if (!HttpSendRequestA(req, "Content-Type: application/json\r\n", -1,
-			      job->body, (DWORD)strlen(job->body))) {
-		post_wininet_error(job->hwnd, "HTTP send failed");
-		goto finish;
+			      (LPVOID)body, (DWORD)strlen(body))) {
+		post_wininet_error(hwnd, "HTTP send failed");
+		goto out;
 	}
 	sz = sizeof status;
 	HttpQueryInfoA(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &sz, NULL);
@@ -297,64 +640,118 @@ static DWORD WINAPI net_thread(LPVOID param)
 
 		while (InternetReadFile(req, tmp, sizeof tmp, &got) && got > 0)
 			sb_add(&eb, tmp, got);
-		sprintf(msg, "proxy returned HTTP %lu %s", (unsigned long)status, eb.p ? eb.p : "");
-		post_error(job->hwnd, msg);
+		sprintf(msg, "proxy HTTP %lu %s", (unsigned long)status, eb.p ? eb.p : "");
+		post_error(hwnd, msg);
 		sb_free(&eb);
-		goto finish;
+		goto out;
 	}
-	while (!done) {
+	for (;;) {
 		char type, ch;
 		char lenbuf[24];
 		int li = 0;
 		long n;
 		char *data;
 
-		if (read_exact(req, &ch, 1) != 0)
+		if (read_exact(req, &ch, 1) != 0) {
+			ok = 0;
 			break;
+		}
 		type = ch;
 		for (;;) {
 			if (read_exact(req, &ch, 1) != 0) {
-				done = 1;
-				break;
+				ok = -1;
+				goto out;
 			}
 			if (ch == '\n')
 				break;
 			if (li < (int)sizeof lenbuf - 1)
 				lenbuf[li++] = ch;
 		}
-		if (done)
-			break;
 		lenbuf[li] = 0;
 		n = atol(lenbuf);
-		if (n < 0 || n > MAX_FRAME)
-			break;
+		if (n < 0 || n > MAX_FRAME) {
+			ok = -1;
+			goto out;
+		}
 		data = (char *)malloc((size_t)n + 1);
-		if (!data)
-			break;
+		if (!data) {
+			ok = -1;
+			goto out;
+		}
 		if (n > 0 && read_exact(req, data, (DWORD)n) != 0) {
 			free(data);
-			break;
+			ok = -1;
+			goto out;
 		}
 		data[n] = 0;
 		if (type == 'D') {
-			PostMessageA(job->hwnd, WM_APP_CHUNK, 0, (LPARAM)data);
+			PostMessageA(hwnd, WM_APP_CHUNK, 0, (LPARAM)data);
 		} else if (type == 'E') {
-			PostMessageA(job->hwnd, WM_APP_ERROR, 0, (LPARAM)data);
+			PostMessageA(hwnd, WM_APP_ERROR, 0, (LPARAM)data);
+		} else if (type == 'T') {
+			ToolCall tc;
+			if (parse_tool_payload(data, n, &tc) == 0) {
+				ToolCall *ni = (ToolCall *)realloc(tl->items,
+								  sizeof(ToolCall) * (size_t)(tl->n + 1));
+				if (ni) {
+					tl->items = ni;
+					tl->items[tl->n++] = tc;
+				} else {
+					free_tool_call(&tc);
+				}
+			}
+			free(data);
+		} else if (type == 'Z') {
+			if (n == 5 && !memcmp(data, "tools", 5))
+				*need_tools = 1;
+			free(data);
+			ok = 0;
+			break;
 		} else {
 			free(data);
-			if (type == 'Z')
-				done = 1;
 		}
 	}
-finish:
+out:
 	if (req)
 		InternetCloseHandle(req);
 	if (conn)
 		InternetCloseHandle(conn);
 	if (inet)
 		InternetCloseHandle(inet);
+	return ok;
+}
+
+static DWORD WINAPI net_thread(LPVOID param)
+{
+	Job *job = (Job *)param;
+	char *body = job->body;
+	int round;
+
+	for (round = 0; round < MAX_TOOL_ROUNDS; round++) {
+		ToolList tl = {0};
+		int need = 0;
+		int rc;
+
+		rc = do_round(job->hwnd, body, &tl, &need);
+		free(body);
+		body = NULL;
+		if (rc != 0) {
+			free_tool_list(&tl);
+			break;
+		}
+		if (!need || tl.n == 0) {
+			free_tool_list(&tl);
+			break;
+		}
+		body = execute_and_build(&tl, job->hwnd);
+		free_tool_list(&tl);
+		if (!body)
+			break;
+	}
+	if (body && round >= MAX_TOOL_ROUNDS)
+		post_error(job->hwnd, "tool loop limit reached");
+	free(body);
 	PostMessageA(job->hwnd, WM_APP_DONE, 0, 0);
-	free(job->body);
 	free(job);
 	return 0;
 }
@@ -379,11 +776,16 @@ static void do_send(void)
 	transcript_append("You: ");
 	transcript_append(text);
 	transcript_append("\r\n\r\nXPCode: ");
-	push_msg("user", text);
 	sb_free(&g_reply);
-	body = build_body();
+	body = build_start_body(text);
 	set_status("Thinking...");
 	free(text);
+	if (!body) {
+		g_busy = 0;
+		EnableWindow(g_send, TRUE);
+		set_status("Out of memory");
+		return;
+	}
 
 	job = (Job *)malloc(sizeof *job);
 	if (!job) {
@@ -511,8 +913,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 			return 0;
 		case IDM_ABOUT:
 			MessageBoxA(hwnd,
-				    "XPCode 0.1\n\nA native Windows XP AI coding client.\n\n"
-				    "Streams over plain HTTP from the Go bridge.",
+				    "XPCode 0.2\n\nA native Windows XP AI coding client.\n\n"
+				    "Streams over plain HTTP from the Go bridge and runs tools locally.",
 				    "About XPCode", MB_OK | MB_ICONINFORMATION);
 			return 0;
 		}
@@ -522,6 +924,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		if (s) {
 			transcript_append(s);
 			sb_str(&g_reply, s);
+			free(s);
+		}
+		return 0;
+	}
+	case WM_APP_LOG: {
+		char *s = (char *)lParam;
+		if (s) {
+			transcript_append(s);
 			free(s);
 		}
 		return 0;
@@ -538,8 +948,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 	}
 	case WM_APP_DONE:
 		transcript_append(g_reply.len ? "\r\n\r\n" : "\r\n");
-		if (g_reply.len)
-			push_msg("assistant", g_reply.p);
 		sb_free(&g_reply);
 		g_busy = 0;
 		EnableWindow(g_send, TRUE);
@@ -564,6 +972,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	(void)show;
 
 	load_settings();
+	sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
+		(unsigned long)GetTickCount());
+
 	memset(&wc, 0, sizeof wc);
 	wc.lpfnWndProc = wnd_proc;
 	wc.hInstance = inst;
