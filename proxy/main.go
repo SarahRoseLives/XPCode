@@ -43,6 +43,7 @@ type upstreamRequest struct {
 type clientRequest struct {
 	Session     string       `json:"session"`
 	Model       string       `json:"model"`
+	Workdir     string       `json:"workdir"`
 	Message     string       `json:"message"`
 	ToolResults []toolResult `json:"tool_results"`
 }
@@ -107,7 +108,7 @@ func toolDefs() []map[string]any {
 			"description": "Read a text file from the XP machine.",
 			"parameters": map[string]any{
 				"type":       "object",
-				"properties": map[string]any{"path": str("Absolute path")},
+				"properties": map[string]any{"path": str("Path relative to the project root, or absolute")},
 				"required":   []string{"path"},
 			},
 		}},
@@ -117,10 +118,37 @@ func toolDefs() []map[string]any {
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":    str("Absolute path"),
+					"path":    str("Path relative to the project root, or absolute"),
 					"content": str("File contents"),
 				},
 				"required": []string{"path", "content"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name":        "edit_file",
+			"description": "Replace text in a file. Fails unless old occurs exactly once, unless all is true.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": str("Path relative to the project root, or absolute"),
+					"old":  str("Exact text to replace"),
+					"new":  str("Replacement text"),
+					"all":  map[string]any{"type": "boolean", "description": "Replace every occurrence"},
+				},
+				"required": []string{"path", "old", "new"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name":        "search",
+			"description": "Search files under the project root (or a given path) for a literal string.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": str("Literal text to find"),
+					"path":    str("Directory relative to the project root"),
+					"max":     map[string]any{"type": "integer", "description": "Maximum matches (default 100)"},
+				},
+				"required": []string{"pattern"},
 			},
 		}},
 		{"type": "function", "function": map[string]any{
@@ -128,7 +156,7 @@ func toolDefs() []map[string]any {
 			"description": "List a directory on the XP machine.",
 			"parameters": map[string]any{
 				"type":       "object",
-				"properties": map[string]any{"path": str("Directory path")},
+				"properties": map[string]any{"path": str("Directory relative to the project root, or absolute")},
 				"required":   []string{"path"},
 			},
 		}},
@@ -185,12 +213,15 @@ func resolveKey() string {
 	return os.Getenv("OPENAI_API_KEY")
 }
 
-func getSession(id string) *session {
+func getSession(id, workdir string) *session {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 	s := sessions[id]
 	if s == nil {
 		sys := *systemFlag
+		if workdir != "" {
+			sys += "\n\nThe project root is " + workdir + ". Prefer paths relative to it."
+		}
 		s = &session{messages: []oaiMessage{{Role: "system", Content: &sys}}}
 		sessions[id] = s
 	}
@@ -387,7 +418,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flushWriter(w)
 
-	s := getSession(req.Session)
+	s := getSession(req.Session, req.Workdir)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

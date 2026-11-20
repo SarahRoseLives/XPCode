@@ -66,9 +66,10 @@ tools/xpctl exec 'start "" C:\xpcode.exe'
 host=Garden.lan
 port=8080
 model=deepseek-chat
+workdir=C:\xpcode-demo
 ```
 
-Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services.
+Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services. Relative tool paths resolve against `workdir`.
 
 Proxy:
 
@@ -84,6 +85,6 @@ The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPE
 
 ## Status
 
-Chat, streaming, and a local tool loop work end-to-end on Windows XP. The model can call `read_file`, `write_file`, `list_dir`, and `run_command`; XPCode executes them in the guest and feeds the results back.
+Chat, streaming, and a local tool loop work end-to-end on Windows XP. The model can call `read_file`, `write_file`, `edit_file`, `list_dir`, `search`, and `run_command`; XPCode executes them in the guest and feeds the results back. Relative paths resolve against `workdir`.
 
 Tools run with the XP user's privileges, so only use this on a machine and with prompts you trust.

@@ -71,6 +71,7 @@ static SB g_reply;
 static char g_host[128] = "Garden.lan";
 static int g_port = 8080;
 static char g_model[128] = "deepseek-chat";
+static char g_workdir[MAX_PATH];
 static char g_session[64];
 
 static char *dupstr(const char *s)
@@ -173,16 +174,26 @@ static void get_ini_path(char *buf)
 
 static void load_settings(void)
 {
-	char path[MAX_PATH];
+	char path[MAX_PATH], exe[MAX_PATH], exe_dir[MAX_PATH];
+	char *slash;
 
+	GetModuleFileNameA(NULL, exe, MAX_PATH);
+	slash = strrchr(exe, '\\');
+	if (slash)
+		slash[1] = 0;
+	strcpy(exe_dir, exe);
 	get_ini_path(path);
 	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
 		WritePrivateProfileStringA("server", "host", "Garden.lan", path);
 		WritePrivateProfileStringA("server", "port", "8080", path);
 		WritePrivateProfileStringA("server", "model", "deepseek-chat", path);
+		WritePrivateProfileStringA("server", "workdir", exe_dir, path);
 	}
 	GetPrivateProfileStringA("server", "host", "Garden.lan", g_host, sizeof g_host, path);
 	GetPrivateProfileStringA("server", "model", "deepseek-chat", g_model, sizeof g_model, path);
+	GetPrivateProfileStringA("server", "workdir", exe_dir, g_workdir, sizeof g_workdir, path);
+	if (GetFileAttributesA(g_workdir) == INVALID_FILE_ATTRIBUTES)
+		strcpy(g_workdir, exe_dir);
 	g_port = GetPrivateProfileIntA("server", "port", 8080, path);
 }
 
@@ -501,7 +512,7 @@ static char *tool_run_command(const char *command)
 		sprintf(cmdline, "cmd.exe /c \"%s\"", bat);
 		memset(&pi, 0, sizeof pi);
 		if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-				    NULL, NULL, &si, &pi)) {
+				    NULL, g_workdir[0] ? g_workdir : NULL, &si, &pi)) {
 			CloseHandle(hout);
 			if (nul != INVALID_HANDLE_VALUE)
 				CloseHandle(nul);
@@ -545,14 +556,250 @@ static char *tool_run_command(const char *command)
 	return b.p ? b.p : dupstr("");
 }
 
+static void resolve_path(const char *in, char *out, size_t cap)
+{
+	size_t n;
+
+	if (!in || !*in) {
+		snprintf(out, cap, "%s", g_workdir);
+		return;
+	}
+	if (in[1] == ':' || (in[0] == '\\' && in[1] == '\\') || in[0] == '/') {
+		snprintf(out, cap, "%s", in);
+		return;
+	}
+	n = strlen(g_workdir);
+	if (n && (g_workdir[n - 1] == '\\' || g_workdir[n - 1] == '/'))
+		snprintf(out, cap, "%s%s", g_workdir, in);
+	else
+		snprintf(out, cap, "%s\\%s", g_workdir, in);
+}
+
+static int should_skip_dir(const char *name)
+{
+	static const char *skip[] = { ".git", ".svn", "node_modules", "build", "dist", "target", ".cache" };
+	size_t i;
+
+	for (i = 0; i < sizeof skip / sizeof skip[0]; i++) {
+		if (!_stricmp(name, skip[i]))
+			return 1;
+	}
+	return 0;
+}
+
+static void search_file(const char *path, const char *pattern, int max, SB *out, int *count)
+{
+	HANDLE h;
+	DWORD size, got = 0, off = 0;
+	char *buf;
+	int line = 1;
+	char *p;
+
+	h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	size = GetFileSize(h, NULL);
+	if (size == INVALID_FILE_SIZE || size > 2 * 1024 * 1024) {
+		CloseHandle(h);
+		return;
+	}
+	buf = (char *)malloc((size_t)size + 1);
+	if (!buf) {
+		CloseHandle(h);
+		return;
+	}
+	while (off < size) {
+		if (!ReadFile(h, buf + off, size - off, &got, NULL) || got == 0)
+			break;
+		off += got;
+	}
+	CloseHandle(h);
+	buf[off] = 0;
+	if (off > 0 && memchr(buf, 0, off)) {
+		free(buf);
+		return;
+	}
+	p = buf;
+	while (p && *p && *count < max) {
+		char *nl = strchr(p, '\n');
+		char linebuf[1400];
+		if (nl)
+			*nl = 0;
+		if (strstr(p, pattern)) {
+			snprintf(linebuf, sizeof linebuf, "%s:%d: %.900s\r\n", path, line, p);
+			sb_str(out, linebuf);
+			(*count)++;
+		}
+		if (!nl)
+			break;
+		p = nl + 1;
+		line++;
+	}
+	free(buf);
+}
+
+static void search_dir(const char *dir, const char *pattern, int max, int depth, SB *out, int *count)
+{
+	char spec[MAX_PATH * 2];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+
+	if (depth > 12 || *count >= max)
+		return;
+	snprintf(spec, sizeof spec, "%s\\*", dir);
+	h = FindFirstFileA(spec, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do {
+		char full[MAX_PATH * 2];
+		if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+			continue;
+		snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			if (!should_skip_dir(fd.cFileName))
+				search_dir(full, pattern, max, depth + 1, out, count);
+		} else {
+			if (fd.nFileSizeHigh == 0 && fd.nFileSizeLow <= 2 * 1024 * 1024)
+				search_file(full, pattern, max, out, count);
+		}
+		if (*count >= max)
+			break;
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+static char *tool_search(const char *pattern, const char *path, int max)
+{
+	SB out = {0};
+	int count = 0;
+	char dir[MAX_PATH * 2];
+
+	if (!pattern || !*pattern)
+		return dupstr("error: pattern is required");
+	if (path && *path)
+		resolve_path(path, dir, sizeof dir);
+	else
+		snprintf(dir, sizeof dir, "%s", g_workdir);
+	search_dir(dir, pattern, max, 0, &out, &count);
+	if (!out.p)
+		return dupstr("(no matches)");
+	return out.p;
+}
+
+static char *tool_edit_file(const char *path, const char *old, const char *neu, int all)
+{
+	HANDLE h;
+	DWORD size, got = 0, off = 0;
+	char *buf, *p;
+	size_t olen;
+	int count = 0, done = 0;
+	SB out = {0};
+	char *w;
+
+	if (!old || !*old)
+		return dupstr("error: old text is empty");
+	h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot open file");
+	size = GetFileSize(h, NULL);
+	if (size == INVALID_FILE_SIZE || size > 4 * 1024 * 1024) {
+		CloseHandle(h);
+		return dupstr("error: file too large");
+	}
+	buf = (char *)malloc((size_t)size + 1);
+	if (!buf) {
+		CloseHandle(h);
+		return dupstr("error: out of memory");
+	}
+	while (off < size) {
+		if (!ReadFile(h, buf + off, size - off, &got, NULL) || got == 0)
+			break;
+		off += got;
+	}
+	CloseHandle(h);
+	buf[off] = 0;
+	olen = strlen(old);
+	p = buf;
+	while ((p = strstr(p, old)) != NULL) {
+		count++;
+		p += olen;
+	}
+	if (count == 0) {
+		free(buf);
+		return dupstr("error: old text not found");
+	}
+	if (count > 1 && !all) {
+		char m[128];
+		sprintf(m, "error: %d matches; pass all=true or add more context", count);
+		free(buf);
+		return dupstr(m);
+	}
+	p = buf;
+	for (;;) {
+		char *q = strstr(p, old);
+		if (!q) {
+			sb_str(&out, p);
+			break;
+		}
+		sb_add(&out, p, (size_t)(q - p));
+		sb_str(&out, neu ? neu : "");
+		p = q + olen;
+		done++;
+		if (!all) {
+			sb_str(&out, p);
+			break;
+		}
+	}
+	free(buf);
+	if (!out.p) {
+		sb_free(&out);
+		return dupstr("error: out of memory");
+	}
+	w = tool_write_file(path, out.p);
+	sb_free(&out);
+	if (strncmp(w, "ok", 2) != 0)
+		return w;
+	free(w);
+	{
+		char m[64];
+		sprintf(m, "ok: replaced %d", done);
+		return dupstr(m);
+	}
+}
+
 static char *execute_tool(ToolCall *tc)
 {
-	if (!strcmp(tc->name, "read_file"))
-		return tool_read_file(arg_of(tc, "path"));
-	if (!strcmp(tc->name, "write_file"))
-		return tool_write_file(arg_of(tc, "path"), arg_of(tc, "content"));
-	if (!strcmp(tc->name, "list_dir"))
-		return tool_list_dir(arg_of(tc, "path"));
+	char path[MAX_PATH * 2];
+
+	if (!strcmp(tc->name, "read_file")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_read_file(path);
+	}
+	if (!strcmp(tc->name, "write_file")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_write_file(path, arg_of(tc, "content"));
+	}
+	if (!strcmp(tc->name, "edit_file")) {
+		const char *all = arg_of(tc, "all");
+		int do_all = (!strcmp(all, "true") || !strcmp(all, "1") || !strcmp(all, "yes"));
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_edit_file(path, arg_of(tc, "old"), arg_of(tc, "new"), do_all);
+	}
+	if (!strcmp(tc->name, "list_dir")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_list_dir(path);
+	}
+	if (!strcmp(tc->name, "search")) {
+		const char *mp = arg_of(tc, "max");
+		int max = *mp ? atoi(mp) : 100;
+		if (max < 1)
+			max = 100;
+		if (max > 500)
+			max = 500;
+		return tool_search(arg_of(tc, "pattern"), arg_of(tc, "path"), max);
+	}
 	if (!strcmp(tc->name, "run_command"))
 		return tool_run_command(arg_of(tc, "command"));
 	return dupstr("error: unknown tool");
@@ -566,6 +813,8 @@ static char *build_start_body(const char *text)
 	sb_json(&b, g_session);
 	sb_str(&b, ",\"model\":");
 	sb_json(&b, g_model);
+	sb_str(&b, ",\"workdir\":");
+	sb_json(&b, g_workdir);
 	sb_str(&b, ",\"message\":");
 	sb_json(&b, text);
 	sb_str(&b, "}");
