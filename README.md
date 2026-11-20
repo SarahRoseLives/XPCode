@@ -79,6 +79,17 @@ xpproxy --mock
 xpproxy --upstream https://api.openai.com/v1/chat/completions --model gpt-4o-mini
 ```
 
+## Worked example: RTL-SDR V4 on native XP
+
+This was used on a real Windows XP SP3 machine, not the VM, to bring up an RTL-SDR Blog V4:
+
+- The agent inventoried the XP install first (no compiler or package manager present) and checked what USB/SDR tooling was already there.
+- It identified the missing driver/tool pieces, fetched current instructions, and worked through the setup step by step.
+- It ran the RTL tools from the project folder, read the device output, and iterated on errors until the receiver initialized and tuned.
+- Result: the V4 running natively on XP, driven entirely from the XPCode window.
+
+Hardware-specific steps vary by dongle and XP build; the point is that the agent can inspect the real machine, fetch what it needs, and iterate instead of guessing.
+
 ## Security
 
 The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`. It is never written into XPCode or committed to this repo. Keep the proxy off untrusted networks. Web pages are untrusted input; the agent is told not to follow instructions found in fetched content, but review its actions. Enable "Ask before running or editing tools" in Settings (or `approve=1`) to confirm each mutating tool call; it is off by default.
