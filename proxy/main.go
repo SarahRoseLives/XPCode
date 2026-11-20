@@ -264,6 +264,25 @@ func appendToolResults(s *session, results []toolResult) {
 	}
 }
 
+func trimSession(s *session) {
+	const maxMessages = 60
+	const keep = 40
+	if len(s.messages) <= maxMessages {
+		return
+	}
+	cut := len(s.messages) - keep
+	for cut < len(s.messages) && s.messages[cut].Role != "user" {
+		cut++
+	}
+	if cut >= len(s.messages) {
+		return
+	}
+	kept := make([]oaiMessage, 0, 1+len(s.messages)-cut)
+	kept = append(kept, s.messages[0])
+	kept = append(kept, s.messages[cut:]...)
+	s.messages = kept
+}
+
 func parseArgs(raw string) []kvp {
 	var m map[string]any
 	if json.Unmarshal([]byte(raw), &m) != nil {
@@ -456,6 +475,12 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		writeFrame(w, 'Z', nil)
 		flushWriter(w)
 		return
+	}
+
+	before := len(s.messages)
+	trimSession(s)
+	if *verbose && len(s.messages) != before {
+		log.Printf("trim session=%s %d -> %d", req.Session, before, len(s.messages))
 	}
 
 	modelName := pickModel(req.Model)
