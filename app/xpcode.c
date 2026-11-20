@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define IDC_TRANSCRIPT 1001
 #define IDC_INPUT 1002
@@ -169,6 +170,64 @@ static void sb_json(SB *b, const char *s)
 		}
 	}
 	sb_str(b, "\"");
+}
+
+static char *normalize_lf(const char *s)
+{
+	size_t n = strlen(s);
+	char *out = (char *)malloc(n + 1);
+	size_t i, j = 0;
+
+	if (!out)
+		return NULL;
+	for (i = 0; i < n; i++) {
+		if (s[i] == '\r' && s[i + 1] == '\n')
+			continue;
+		out[j++] = s[i];
+	}
+	out[j] = 0;
+	return out;
+}
+
+static char *to_crlf(const char *s)
+{
+	SB b = {0};
+	size_t i;
+
+	for (i = 0; s[i]; i++) {
+		if (s[i] == '\r')
+			continue;
+		if (s[i] == '\n')
+			sb_str(&b, "\r\n");
+		else
+			sb_add(&b, s + i, 1);
+	}
+	if (!b.p)
+		return dupstr("");
+	return b.p;
+}
+
+static int wildcard_match(const char *pat, const char *str)
+{
+	const char *p = pat, *s = str, *star = NULL, *ss = NULL;
+
+	while (*s) {
+		if (*p == '?' || (*p && tolower((unsigned char)*p) == tolower((unsigned char)*s))) {
+			p++;
+			s++;
+		} else if (*p == '*') {
+			star = p++;
+			ss = s;
+		} else if (star) {
+			p = star + 1;
+			s = ++ss;
+		} else {
+			return 0;
+		}
+	}
+	while (*p == '*')
+		p++;
+	return *p == 0;
 }
 
 static void get_ini_path(char *buf)
@@ -484,6 +543,17 @@ static const char *arg_of(ToolCall *tc, const char *key)
 	return "";
 }
 
+static const char *arg_find(ToolCall *tc, const char *key)
+{
+	int i;
+
+	for (i = 0; i < tc->nargs; i++) {
+		if (!strcmp(tc->args[i].k, key))
+			return tc->args[i].v ? tc->args[i].v : "";
+	}
+	return NULL;
+}
+
 static char *tool_read_file(const char *path, int start, int lines)
 {
 	HANDLE h;
@@ -511,6 +581,14 @@ static char *tool_read_file(const char *path, int start, int lines)
 		ReadFile(h, buf, size, &got, NULL);
 	CloseHandle(h);
 	buf[got] = 0;
+	{
+		char *lf = normalize_lf(buf);
+		if (lf) {
+			free(buf);
+			buf = lf;
+			got = (DWORD)strlen(buf);
+		}
+	}
 
 	if (start <= 0 && lines <= 0) {
 		if (got > wholecap) {
@@ -572,17 +650,23 @@ static char *tool_write_file(const char *path, const char *content)
 {
 	HANDLE h;
 	DWORD wrote = 0;
-	size_t len = strlen(content);
+	char *crlf = to_crlf(content);
+	const char *data = crlf ? crlf : content;
+	size_t len = strlen(data);
 
 	h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
 			FILE_ATTRIBUTE_NORMAL, NULL);
-	if (h == INVALID_HANDLE_VALUE)
+	if (h == INVALID_HANDLE_VALUE) {
+		free(crlf);
 		return dupstr("error: cannot open file for writing");
-	if (len > 0 && !WriteFile(h, content, (DWORD)len, &wrote, NULL)) {
+	}
+	if (len > 0 && !WriteFile(h, data, (DWORD)len, &wrote, NULL)) {
 		CloseHandle(h);
+		free(crlf);
 		return dupstr("error: write failed");
 	}
 	CloseHandle(h);
+	free(crlf);
 	return dupstr("ok");
 }
 
@@ -794,6 +878,43 @@ static int should_skip_dir(const char *name)
 	return 0;
 }
 
+static void build_tree(SB *b, const char *dir, int depth, int *count)
+{
+	char spec[MAX_PATH * 2];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+
+	if (depth > 2 || *count >= 80 || b->len > 3500)
+		return;
+	snprintf(spec, sizeof spec, "%s\\*", dir);
+	h = FindFirstFileA(spec, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do {
+		char full[MAX_PATH * 2];
+		int i;
+		if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+			continue;
+		if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+		    should_skip_dir(fd.cFileName))
+			continue;
+		for (i = 0; i < depth; i++)
+			sb_str(b, "  ");
+		sb_str(b, fd.cFileName);
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			sb_str(b, "\\");
+		sb_str(b, "\r\n");
+		(*count)++;
+		if (*count >= 80 || b->len > 3500)
+			break;
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
+			build_tree(b, full, depth + 1, count);
+		}
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
 static void search_file(const char *path, const char *pattern, int max, SB *out, int *count)
 {
 	HANDLE h;
@@ -826,6 +947,13 @@ static void search_file(const char *path, const char *pattern, int max, SB *out,
 	if (off > 0 && memchr(buf, 0, off)) {
 		free(buf);
 		return;
+	}
+	{
+		char *lf = normalize_lf(buf);
+		if (lf) {
+			free(buf);
+			buf = lf;
+		}
 	}
 	p = buf;
 	while (p && *p && *count < max) {
@@ -894,6 +1022,55 @@ static char *tool_search(const char *pattern, const char *path, int max)
 	return out.p;
 }
 
+static void glob_dir(const char *dir, const char *pattern, int max, int depth, SB *out, int *count)
+{
+	char spec[MAX_PATH * 2];
+	WIN32_FIND_DATAA fd;
+	HANDLE h;
+
+	if (depth > 12 || *count >= max)
+		return;
+	snprintf(spec, sizeof spec, "%s\\*", dir);
+	h = FindFirstFileA(spec, &fd);
+	if (h == INVALID_HANDLE_VALUE)
+		return;
+	do {
+		char full[MAX_PATH * 2];
+		if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+			continue;
+		snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			if (!should_skip_dir(fd.cFileName))
+				glob_dir(full, pattern, max, depth + 1, out, count);
+		} else if (wildcard_match(pattern, fd.cFileName)) {
+			sb_str(out, full);
+			sb_str(out, "\r\n");
+			(*count)++;
+		}
+		if (*count >= max)
+			break;
+	} while (FindNextFileA(h, &fd));
+	FindClose(h);
+}
+
+static char *tool_glob(const char *pattern, const char *path, int max)
+{
+	SB out = {0};
+	int count = 0;
+	char dir[MAX_PATH * 2];
+
+	if (!pattern || !*pattern)
+		return dupstr("error: pattern is required");
+	if (path && *path)
+		resolve_path(path, dir, sizeof dir);
+	else
+		snprintf(dir, sizeof dir, "%s", g_workdir);
+	glob_dir(dir, pattern, max, 0, &out, &count);
+	if (!out.p)
+		return dupstr("(no matches)");
+	return out.p;
+}
+
 static char *tool_edit_file(const char *path, const char *old, const char *neu, int all)
 {
 	HANDLE h;
@@ -927,6 +1104,13 @@ static char *tool_edit_file(const char *path, const char *old, const char *neu, 
 	}
 	CloseHandle(h);
 	buf[off] = 0;
+	{
+		char *lf = normalize_lf(buf);
+		if (lf) {
+			free(buf);
+			buf = lf;
+		}
+	}
 	olen = strlen(old);
 	p = buf;
 	while ((p = strstr(p, old)) != NULL) {
@@ -976,10 +1160,98 @@ static char *tool_edit_file(const char *path, const char *old, const char *neu, 
 	}
 }
 
+static char *tool_apply_patch(const char *path, ToolCall *tc)
+{
+	HANDLE h;
+	DWORD size, got = 0, off = 0;
+	char *cur;
+	int i, edits = 0;
+	char *w;
+
+	h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return dupstr("error: cannot open file");
+	size = GetFileSize(h, NULL);
+	if (size == INVALID_FILE_SIZE || size > 4 * 1024 * 1024) {
+		CloseHandle(h);
+		return dupstr("error: file too large");
+	}
+	cur = (char *)malloc((size_t)size + 1);
+	if (!cur) {
+		CloseHandle(h);
+		return dupstr("error: out of memory");
+	}
+	while (off < size) {
+		if (!ReadFile(h, cur + off, size - off, &got, NULL) || got == 0)
+			break;
+		off += got;
+	}
+	CloseHandle(h);
+	cur[off] = 0;
+	{
+		char *lf = normalize_lf(cur);
+		if (lf) {
+			free(cur);
+			cur = lf;
+		}
+	}
+	for (i = 1;; i++) {
+		char key[16];
+		const char *old, *neu, *p;
+		int cnt = 0;
+		SB nb = {0};
+
+		sprintf(key, "old%d", i);
+		old = arg_find(tc, key);
+		if (!old)
+			break;
+		sprintf(key, "new%d", i);
+		neu = arg_find(tc, key);
+		if (!*old) {
+			free(cur);
+			return dupstr("error: old text is empty");
+		}
+		p = cur;
+		while ((p = strstr(p, old)) != NULL) {
+			cnt++;
+			p += strlen(old);
+		}
+		if (cnt != 1) {
+			char m[160];
+			sprintf(m, "error: edit %d matched %d times; each old must match exactly once", i, cnt);
+			free(cur);
+			return dupstr(m);
+		}
+		p = strstr(cur, old);
+		sb_add(&nb, cur, (size_t)(p - cur));
+		sb_str(&nb, neu ? neu : "");
+		sb_str(&nb, p + strlen(old));
+		free(cur);
+		cur = nb.p ? nb.p : dupstr("");
+		edits++;
+	}
+	if (edits == 0) {
+		free(cur);
+		return dupstr("error: no edits provided");
+	}
+	w = tool_write_file(path, cur);
+	free(cur);
+	if (strncmp(w, "ok", 2) != 0)
+		return w;
+	free(w);
+	{
+		char m[64];
+		sprintf(m, "ok: %d edits", edits);
+		return dupstr(m);
+	}
+}
+
 static int needs_approval(const char *name)
 {
 	return !strcmp(name, "write_file") || !strcmp(name, "edit_file") ||
-	       !strcmp(name, "make_dir") || !strcmp(name, "run_command");
+	       !strcmp(name, "apply_patch") || !strcmp(name, "make_dir") ||
+	       !strcmp(name, "run_command");
 }
 
 static void approval_text(ToolCall *tc, char *out, size_t cap)
@@ -1021,6 +1293,10 @@ static char *execute_tool(ToolCall *tc)
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
 		return tool_write_file(path, arg_of(tc, "content"));
 	}
+	if (!strcmp(tc->name, "apply_patch")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_apply_patch(path, tc);
+	}
 	if (!strcmp(tc->name, "edit_file")) {
 		const char *all = arg_of(tc, "all");
 		int do_all = (!strcmp(all, "true") || !strcmp(all, "1") || !strcmp(all, "yes"));
@@ -1034,6 +1310,15 @@ static char *execute_tool(ToolCall *tc)
 	if (!strcmp(tc->name, "list_dir")) {
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
 		return tool_list_dir(path);
+	}
+	if (!strcmp(tc->name, "glob")) {
+		const char *mp = arg_of(tc, "max");
+		int max = *mp ? atoi(mp) : 200;
+		if (max < 1)
+			max = 200;
+		if (max > 1000)
+			max = 1000;
+		return tool_glob(arg_of(tc, "pattern"), arg_of(tc, "path"), max);
 	}
 	if (!strcmp(tc->name, "search")) {
 		const char *mp = arg_of(tc, "max");
@@ -1066,6 +1351,14 @@ static char *build_start_body(const char *text)
 	sb_json(&b, g_model);
 	sb_str(&b, ",\"workdir\":");
 	sb_json(&b, g_workdir);
+	{
+		SB tree = {0};
+		int tcount = 0;
+		build_tree(&tree, g_workdir, 0, &tcount);
+		sb_str(&b, ",\"context\":");
+		sb_json(&b, tree.p ? tree.p : "");
+		sb_free(&tree);
+	}
 	sb_str(&b, ",\"message\":");
 	sb_json(&b, text);
 	sb_str(&b, "}");

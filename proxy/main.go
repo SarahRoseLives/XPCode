@@ -44,6 +44,7 @@ type clientRequest struct {
 	Session     string       `json:"session"`
 	Model       string       `json:"model"`
 	Workdir     string       `json:"workdir"`
+	Context     string       `json:"context"`
 	Message     string       `json:"message"`
 	ToolResults []toolResult `json:"tool_results"`
 }
@@ -87,7 +88,7 @@ var (
 	apiKey     = flag.String("api-key", "", "API key (defaults to DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 	apiKeyFile = flag.String("api-key-file", "", "read the API key from this file")
 	modelFlag  = flag.String("model", "", "force this model for every request")
-	systemFlag = flag.String("system", "You are XPCode, a coding assistant running inside Windows XP. Use the provided tools to inspect files and run commands on the XP machine. Prefer small, safe steps. Be concise.", "system prompt added when the client sends none (empty disables)")
+	systemFlag = flag.String("system", "You are XPCode, a coding agent running inside Windows XP. You can inspect files and run commands on this machine through tools.\n\nWork like a careful engineer:\n- Inspect before changing: use list_dir, glob, search, and read_file.\n- Prefer small, focused edits with edit_file or apply_patch; do not rewrite files blindly.\n- After changing code, run a build or test command when one is available.\n- Keep replies short; say what you changed and how you verified it.\n- Use paths relative to the project root unless an absolute path is needed.", "system prompt added when the client sends none (empty disables)")
 	mockMode   = flag.Bool("mock", false, "stream a canned reply instead of calling the upstream")
 	verbose    = flag.Bool("verbose", false, "log each request and upstream status")
 	defaultMdl = "deepseek-chat"
@@ -156,12 +157,41 @@ func toolDefs() []map[string]any {
 			},
 		}},
 		{"type": "function", "function": map[string]any{
+			"name":        "apply_patch",
+			"description": "Apply several exact replacements to one file atomically. Provide path plus old1/new1, old2/new2, ... Each old must occur exactly once.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": str("Path relative to the project root, or absolute"),
+					"old1": str("First text to replace"),
+					"new1": str("First replacement"),
+					"old2": str("Second text to replace (optional)"),
+					"new2": str("Second replacement (optional)"),
+					"old3": str("Third text to replace (optional)"),
+					"new3": str("Third replacement (optional)"),
+				},
+				"required": []string{"path", "old1", "new1"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
 			"name":        "make_dir",
 			"description": "Create a directory (and any missing parents) on the XP machine.",
 			"parameters": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"path": str("Directory relative to the project root, or absolute")},
 				"required":   []string{"path"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
+			"name":        "glob",
+			"description": "Find files by wildcard name (for example *.c) under the project root.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern": str("File name wildcard, e.g. *.c or main.*"),
+					"path":    str("Directory relative to the project root (optional)"),
+				},
+				"required": []string{"pattern"},
 			},
 		}},
 		{"type": "function", "function": map[string]any{
@@ -229,14 +259,17 @@ func resolveKey() string {
 	return os.Getenv("OPENAI_API_KEY")
 }
 
-func getSession(id, workdir string) *session {
+func getSession(id, workdir, projectTree string) *session {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 	s := sessions[id]
 	if s == nil {
 		sys := *systemFlag
 		if workdir != "" {
-			sys += "\n\nThe project root is " + workdir + ". Prefer paths relative to it."
+			sys += "\n\nProject root: " + workdir
+		}
+		if projectTree != "" {
+			sys += "\n\nProject files (partial):\n" + projectTree
 		}
 		s = &session{messages: []oaiMessage{{Role: "system", Content: &sys}}}
 		sessions[id] = s
@@ -453,7 +486,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flushWriter(w)
 
-	s := getSession(req.Session, req.Workdir)
+	s := getSession(req.Session, req.Workdir, req.Context)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
