@@ -81,7 +81,7 @@ xpproxy --upstream https://api.openai.com/v1/chat/completions --model gpt-4o-min
 
 ## Security
 
-The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`. It is never written into XPCode or committed to this repo. Keep the proxy off untrusted networks.
+The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`. It is never written into XPCode or committed to this repo. Keep the proxy off untrusted networks. Enable "Ask before running or editing tools" in Settings (or `approve=1`) to confirm each mutating tool call.
 
 ## Status
 

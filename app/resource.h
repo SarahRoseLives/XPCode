@@ -7,6 +7,7 @@
 #define IDC_SET_MODEL 1103
 #define IDC_SET_WORKDIR 1104
 #define IDC_SET_BROWSE 1105
+#define IDC_SET_APPROVE 1106
 #define IDC_SET_OK 1
 #define IDC_SET_CANCEL 2
 

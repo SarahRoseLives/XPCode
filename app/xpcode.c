@@ -78,6 +78,7 @@ static HFONT g_font;
 static WNDPROC g_edit_proc;
 static int g_busy;
 static volatile LONG g_cancel;
+static int g_approve;
 static SB g_reply;
 static char g_host[128] = "Garden.lan";
 static int g_port = 8080;
@@ -227,12 +228,14 @@ static void load_settings(void)
 		WritePrivateProfileStringA("server", "port", "8080", path);
 		WritePrivateProfileStringA("server", "model", "deepseek-chat", path);
 		WritePrivateProfileStringA("server", "workdir", exe_dir, path);
+		WritePrivateProfileStringA("server", "approve", "0", path);
 	}
 	GetPrivateProfileStringA("server", "host", "Garden.lan", g_host, sizeof g_host, path);
 	GetPrivateProfileStringA("server", "model", "deepseek-chat", g_model, sizeof g_model, path);
 	GetPrivateProfileStringA("server", "workdir", exe_dir, g_workdir, sizeof g_workdir, path);
 	if (GetFileAttributesA(g_workdir) == INVALID_FILE_ATTRIBUTES)
 		strcpy(g_workdir, exe_dir);
+	g_approve = GetPrivateProfileIntA("server", "approve", 0, path);
 	g_port = GetPrivateProfileIntA("server", "port", 8080, path);
 }
 
@@ -969,9 +972,34 @@ static char *tool_edit_file(const char *path, const char *old, const char *neu, 
 	}
 }
 
+static int needs_approval(const char *name)
+{
+	return !strcmp(name, "write_file") || !strcmp(name, "edit_file") ||
+	       !strcmp(name, "make_dir") || !strcmp(name, "run_command");
+}
+
+static void approval_text(ToolCall *tc, char *out, size_t cap)
+{
+	const char *path = arg_of(tc, "path");
+	const char *cmd = arg_of(tc, "command");
+
+	if (!*path)
+		path = arg_of(tc, "pattern");
+	snprintf(out, cap, "XPCode wants to run:\n\n%s\n\n%s\n\nAllow?",
+		 tc->name, *cmd ? cmd : path);
+}
+
 static char *execute_tool(ToolCall *tc)
 {
 	char path[MAX_PATH * 2];
+
+	if (g_approve && needs_approval(tc->name)) {
+		char msg[1200];
+		approval_text(tc, msg, sizeof msg);
+		if (MessageBoxA(g_hwnd, msg, "XPCode: approve tool call",
+				MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+			return dupstr("denied by user");
+	}
 
 	if (!strcmp(tc->name, "read_file")) {
 		const char *ss = arg_of(tc, "start");
@@ -1423,6 +1451,7 @@ static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
 		SetDlgItemTextA(dlg, IDC_SET_PORT, port);
 		SetDlgItemTextA(dlg, IDC_SET_MODEL, g_model);
 		SetDlgItemTextA(dlg, IDC_SET_WORKDIR, g_workdir);
+		CheckDlgButton(dlg, IDC_SET_APPROVE, g_approve ? BST_CHECKED : BST_UNCHECKED);
 		return TRUE;
 	}
 	case WM_COMMAND:
@@ -1453,6 +1482,7 @@ static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
 			GetDlgItemTextA(dlg, IDC_SET_PORT, port, sizeof port);
 			GetDlgItemTextA(dlg, IDC_SET_MODEL, model, sizeof model);
 			GetDlgItemTextA(dlg, IDC_SET_WORKDIR, work, sizeof work);
+			g_approve = IsDlgButtonChecked(dlg, IDC_SET_APPROVE) == BST_CHECKED;
 			p = atoi(port);
 			if (p < 1 || p > 65535)
 				p = 8080;
@@ -1462,6 +1492,7 @@ static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
 			WritePrivateProfileStringA("server", "port", port, ini);
 			WritePrivateProfileStringA("server", "model", model[0] ? model : "deepseek-chat", ini);
 			WritePrivateProfileStringA("server", "workdir", work[0] ? work : g_workdir, ini);
+			WritePrivateProfileStringA("server", "approve", g_approve ? "1" : "0", ini);
 			EndDialog(dlg, 1);
 			return TRUE;
 		}
