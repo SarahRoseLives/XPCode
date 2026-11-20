@@ -437,12 +437,13 @@ static const char *arg_of(ToolCall *tc, const char *key)
 	return "";
 }
 
-static char *tool_read_file(const char *path)
+static char *tool_read_file(const char *path, int start, int lines)
 {
 	HANDLE h;
 	DWORD full, size, got = 0;
-	char *s;
-	const DWORD cap = 512 * 1024;
+	char *buf, *p, *end, *out;
+	const DWORD readcap = 4 * 1024 * 1024;
+	const DWORD wholecap = 512 * 1024;
 
 	h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, 0, NULL);
@@ -453,19 +454,71 @@ static char *tool_read_file(const char *path)
 		CloseHandle(h);
 		return dupstr("error: cannot stat file");
 	}
-	size = full > cap ? cap : full;
-	s = (char *)malloc((size_t)size + 32);
-	if (!s) {
+	size = full > readcap ? readcap : full;
+	buf = (char *)malloc((size_t)size + 64);
+	if (!buf) {
 		CloseHandle(h);
 		return dupstr("error: out of memory");
 	}
 	if (size > 0)
-		ReadFile(h, s, size, &got, NULL);
+		ReadFile(h, buf, size, &got, NULL);
 	CloseHandle(h);
-	s[got] = 0;
-	if (full > cap)
-		strcpy(s + got, "\n[truncated]");
-	return s;
+	buf[got] = 0;
+
+	if (start <= 0 && lines <= 0) {
+		if (got > wholecap) {
+			buf[wholecap] = 0;
+			strcpy(buf + wholecap, "\n[truncated]");
+		}
+		return buf;
+	}
+
+	p = buf;
+	{
+		int line = 1;
+		while (line < start && *p) {
+			char *nl = strchr(p, '\n');
+			if (!nl) {
+				p += strlen(p);
+				break;
+			}
+			p = nl + 1;
+			line++;
+		}
+	}
+	if (!*p) {
+		free(buf);
+		return dupstr("(empty range)");
+	}
+	end = p;
+	{
+		int n = 0;
+		while (*end && (lines <= 0 || n < lines)) {
+			char *nl = strchr(end, '\n');
+			if (!nl) {
+				end += strlen(end);
+				break;
+			}
+			end = nl + 1;
+			n++;
+		}
+	}
+	{
+		size_t len = (size_t)(end - p);
+		if (len > 256 * 1024)
+			len = 256 * 1024;
+		out = (char *)malloc(len + 32);
+		if (!out) {
+			free(buf);
+			return dupstr("error: out of memory");
+		}
+		memcpy(out, p, len);
+		out[len] = 0;
+		if ((size_t)(end - p) > len)
+			strcpy(out + len, "\n[truncated]");
+	}
+	free(buf);
+	return out;
 }
 
 static char *tool_write_file(const char *path, const char *content)
@@ -859,8 +912,16 @@ static char *execute_tool(ToolCall *tc)
 	char path[MAX_PATH * 2];
 
 	if (!strcmp(tc->name, "read_file")) {
+		const char *ss = arg_of(tc, "start");
+		const char *ls = arg_of(tc, "lines");
+		int start = *ss ? atoi(ss) : 0;
+		int cnt = *ls ? atoi(ls) : 0;
+		if (start < 0)
+			start = 0;
+		if (cnt < 0)
+			cnt = 0;
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
-		return tool_read_file(path);
+		return tool_read_file(path, start, cnt);
 	}
 	if (!strcmp(tc->name, "write_file")) {
 		resolve_path(arg_of(tc, "path"), path, sizeof path);

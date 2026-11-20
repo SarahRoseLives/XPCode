@@ -105,11 +105,15 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		{"type": "function", "function": map[string]any{
 			"name":        "read_file",
-			"description": "Read a text file from the XP machine.",
+			"description": "Read a text file, optionally a line range.",
 			"parameters": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"path": str("Path relative to the project root, or absolute")},
-				"required":   []string{"path"},
+				"type": "object",
+				"properties": map[string]any{
+					"path":  str("Path relative to the project root, or absolute"),
+					"start": map[string]any{"type": "integer", "description": "First line (1-based)"},
+					"lines": map[string]any{"type": "integer", "description": "Number of lines to return"},
+				},
+				"required": []string{"path"},
 			},
 		}},
 		{"type": "function", "function": map[string]any{
