@@ -87,4 +87,4 @@ The API key lives only on the host: a mode-600 file or `DEEPSEEK_API_KEY` / `OPE
 
 Chat, streaming, and a local tool loop work end-to-end on Windows XP. The model can call `read_file`, `write_file`, `edit_file`, `make_dir`, `list_dir`, `search`, and `run_command`; XPCode executes them in the guest and feeds the results back. Relative paths resolve against `workdir`, `read_file` accepts optional `start`/`lines`, and `run_command` takes a timeout.
 
-The transcript is UTF-8/Unicode safe. Tools run with the XP user's privileges, so only use this on a machine and with prompts you trust.
+The transcript is UTF-8/Unicode safe and is appended to `xpcode.log` next to the executable. Tools run with the XP user's privileges, so only use this on a machine and with prompts you trust.

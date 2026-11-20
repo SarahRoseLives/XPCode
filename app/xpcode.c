@@ -22,6 +22,7 @@
 #define IDM_NEW 2004
 #define IDM_WORKDIR 2005
 #define IDM_SETTINGS_FILE 2006
+#define IDM_LOG 2007
 
 #define WM_APP_CHUNK (WM_APP + 1)
 #define WM_APP_DONE (WM_APP + 2)
@@ -177,6 +178,34 @@ static void get_ini_path(char *buf)
 		slash[1] = 0;
 	strcpy(buf, exe);
 	strcat(buf, "xpcode.ini");
+}
+
+static void get_log_path(char *buf)
+{
+	char exe[MAX_PATH];
+	char *slash;
+
+	GetModuleFileNameA(NULL, exe, MAX_PATH);
+	slash = strrchr(exe, '\\');
+	if (slash)
+		slash[1] = 0;
+	strcpy(buf, exe);
+	strcat(buf, "xpcode.log");
+}
+
+static void log_append(const char *s)
+{
+	char path[MAX_PATH];
+	FILE *fp;
+
+	if (!s || !*s)
+		return;
+	get_log_path(path);
+	fp = fopen(path, "ab");
+	if (!fp)
+		return;
+	fputs(s, fp);
+	fclose(fp);
 }
 
 static void load_settings(void)
@@ -1188,6 +1217,9 @@ static void do_send(void)
 	SetWindowTextA(g_input, "");
 	transcript_append_styled("You: ", RGB(0, 0, 180), 1);
 	transcript_append(text);
+	log_append("You: ");
+	log_append(text);
+	log_append("\r\n");
 	transcript_append("\r\n\r\n");
 	transcript_append_styled("XPCode: ", RGB(0, 128, 0), 1);
 	sb_free(&g_reply);
@@ -1248,9 +1280,19 @@ static HMENU build_menu(void)
 	AppendMenuA(settings, MF_STRING, IDM_SETTINGS_FILE, "Open Settings &File");
 	AppendMenuA(settings, MF_STRING, IDM_WORKDIR, "Choose &Working Folder...");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)settings, "&Settings");
+	AppendMenuA(help, MF_STRING, IDM_LOG, "Open &Log File");
+	AppendMenuA(help, MF_SEPARATOR, 0, NULL);
 	AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)help, "&Help");
 	return menu;
+}
+
+static void open_log(void)
+{
+	char path[MAX_PATH];
+
+	get_log_path(path);
+	ShellExecuteA(g_hwnd, "open", "notepad.exe", path, NULL, SW_SHOW);
 }
 
 static void open_settings_file(void)
@@ -1261,6 +1303,14 @@ static void open_settings_file(void)
 	ShellExecuteA(g_hwnd, "open", "notepad.exe", path, NULL, SW_SHOW);
 }
 
+static void update_title(void)
+{
+	char title[MAX_PATH + 16];
+
+	snprintf(title, sizeof title, "XPCode - %s", g_workdir[0] ? g_workdir : "");
+	SetWindowTextA(g_hwnd, title);
+}
+
 static void new_chat(void)
 {
 	if (g_busy)
@@ -1269,6 +1319,7 @@ static void new_chat(void)
 	sb_free(&g_reply);
 	sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
 		(unsigned long)GetTickCount());
+	log_append("\r\n=== new chat ===\r\n");
 	set_status("New chat");
 	SetFocus(g_input);
 }
@@ -1295,6 +1346,7 @@ static void choose_workdir(void)
 		get_ini_path(ini);
 		WritePrivateProfileStringA("server", "workdir", g_workdir, ini);
 		new_chat();
+		update_title();
 		set_status(g_workdir);
 	}
 	ILFree(pidl);
@@ -1376,6 +1428,7 @@ static void show_settings(void)
 	if (r == 1) {
 		load_settings();
 		new_chat();
+		update_title();
 		set_status("Settings saved");
 	}
 }
@@ -1458,6 +1511,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		case IDM_EXIT:
 			DestroyWindow(hwnd);
 			return 0;
+		case IDM_LOG:
+			open_log();
+			return 0;
 		case IDM_ABOUT:
 			MessageBoxA(hwnd,
 				    "XPCode 0.2\n\nA native Windows XP AI coding client.\n\n"
@@ -1479,12 +1535,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		char *s = (char *)lParam;
 		if (s) {
 			transcript_append_styled(s, RGB(110, 110, 110), 0);
+			log_append(s);
 			free(s);
 		}
 		return 0;
 	}
 	case WM_APP_ERROR: {
 		char *s = (char *)lParam;
+		log_append("[error] ");
+		if (s)
+			log_append(s);
+		log_append("\r\n");
 		transcript_append_styled("\r\n[error] ", RGB(180, 0, 0), 1);
 		if (s) {
 			transcript_append_styled(s, RGB(180, 0, 0), 0);
@@ -1502,6 +1563,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		return 0;
 	}
 	case WM_APP_DONE:
+		if (g_reply.p) {
+			log_append("XPCode: ");
+			log_append(g_reply.p);
+			log_append("\r\n\r\n");
+		}
 		transcript_append(g_reply.len ? "\r\n\r\n" : "\r\n");
 		sb_free(&g_reply);
 		g_busy = 0;
@@ -1554,6 +1620,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 				 ww, wh, NULL, build_menu(), inst, NULL);
 	if (!g_hwnd)
 		return 1;
+	update_title();
 	ShowWindow(g_hwnd, SW_SHOW);
 	UpdateWindow(g_hwnd);
 
