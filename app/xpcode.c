@@ -16,6 +16,7 @@
 #define IDC_INPUT 1002
 #define IDC_SEND 1003
 #define IDC_STATUS 1004
+#define IDC_STOP 1005
 #define IDM_EXIT 2001
 #define IDM_SETTINGS 2002
 #define IDM_ABOUT 2003
@@ -71,10 +72,12 @@ static HWND g_hwnd;
 static HWND g_transcript;
 static HWND g_input;
 static HWND g_send;
+static HWND g_stop;
 static HWND g_status;
 static HFONT g_font;
 static WNDPROC g_edit_proc;
 static int g_busy;
+static volatile LONG g_cancel;
 static SB g_reply;
 static char g_host[128] = "Garden.lan";
 static int g_port = 8080;
@@ -323,9 +326,21 @@ static int read_exact(HINTERNET h, char *buf, DWORD n)
 
 	while (off < n) {
 		DWORD got = 0;
-		if (!InternetReadFile(h, buf + off, n - off, &got) || got == 0)
+		if (g_cancel)
 			return -1;
-		off += got;
+		if (InternetReadFile(h, buf + off, n - off, &got)) {
+			if (got == 0)
+				return -1;
+			off += got;
+		} else {
+			DWORD e = GetLastError();
+			if (e == ERROR_INTERNET_TIMEOUT) {
+				if (g_cancel)
+					return -1;
+				continue;
+			}
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -610,7 +625,9 @@ static char *tool_run_command(const char *command, int timeout_sec)
 	PROCESS_INFORMATION pi;
 	DWORD wrote = 0, code = 0, size = 0, off = 0, got = 0;
 	DWORD wait;
+	LONG deadline;
 	int timed_out;
+	int cancelled;
 	char *body = NULL;
 	SB b = {0};
 	char head[64];
@@ -668,9 +685,23 @@ static char *tool_run_command(const char *command, int timeout_sec)
 	CloseHandle(hout);
 	if (nul != INVALID_HANDLE_VALUE)
 		CloseHandle(nul);
-	wait = WaitForSingleObject(pi.hProcess, (DWORD)timeout_sec * 1000);
-	timed_out = (wait == WAIT_TIMEOUT);
-	if (timed_out) {
+	deadline = (LONG)(GetTickCount() + (DWORD)timeout_sec * 1000);
+	timed_out = 0;
+	cancelled = 0;
+	for (;;) {
+		wait = WaitForSingleObject(pi.hProcess, 250);
+		if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED)
+			break;
+		if (g_cancel) {
+			cancelled = 1;
+			break;
+		}
+		if ((LONG)(deadline - (LONG)GetTickCount()) <= 0) {
+			timed_out = 1;
+			break;
+		}
+	}
+	if (timed_out || cancelled) {
 		TerminateProcess(pi.hProcess, 1);
 		WaitForSingleObject(pi.hProcess, 5000);
 	}
@@ -701,7 +732,9 @@ static char *tool_run_command(const char *command, int timeout_sec)
 	sprintf(head, "exit=%lu\r\n", (unsigned long)code);
 	sb_str(&b, head);
 	sb_str(&b, body ? body : "");
-	if (timed_out) {
+	if (cancelled) {
+		sb_str(&b, "\r\n[cancelled]");
+	} else if (timed_out) {
 		char note[64];
 		sprintf(note, "\r\n[timed out after %d s]", timeout_sec);
 		sb_str(&b, note);
@@ -1053,23 +1086,27 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 	conn = InternetConnectA(inet, g_host, (INTERNET_PORT)g_port, NULL, NULL,
 				INTERNET_SERVICE_HTTP, 0, 0);
 	if (!conn) {
-		post_wininet_error(hwnd, "cannot reach proxy");
+		if (!g_cancel)
+			post_wininet_error(hwnd, "cannot reach proxy");
 		goto out;
 	}
 	req = HttpOpenRequestA(conn, "POST", "/api/chat", NULL, NULL, NULL,
 			       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
 	if (!req) {
-		post_wininet_error(hwnd, "HttpOpenRequest failed");
+		if (!g_cancel)
+			post_wininet_error(hwnd, "HttpOpenRequest failed");
 		goto out;
 	}
 	{
-		DWORD rto = 120000;
+		DWORD rto = 1000;
+		DWORD sto = 120000;
 		InternetSetOptionA(req, INTERNET_OPTION_RECEIVE_TIMEOUT, &rto, sizeof rto);
-		InternetSetOptionA(req, INTERNET_OPTION_SEND_TIMEOUT, &rto, sizeof rto);
+		InternetSetOptionA(req, INTERNET_OPTION_SEND_TIMEOUT, &sto, sizeof sto);
 	}
 	if (!HttpSendRequestA(req, "Content-Type: application/json\r\n", -1,
 			      (LPVOID)body, (DWORD)strlen(body))) {
-		post_wininet_error(hwnd, "HTTP send failed");
+		if (!g_cancel)
+			post_wininet_error(hwnd, "HTTP send failed");
 		goto out;
 	}
 	sz = sizeof status;
@@ -1083,7 +1120,8 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 		while (InternetReadFile(req, tmp, sizeof tmp, &got) && got > 0)
 			sb_add(&eb, tmp, got);
 		sprintf(msg, "proxy HTTP %lu %s", (unsigned long)status, eb.p ? eb.p : "");
-		post_error(hwnd, msg);
+		if (!g_cancel)
+			post_error(hwnd, msg);
 		sb_free(&eb);
 		goto out;
 	}
@@ -1094,6 +1132,10 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 		long n;
 		char *data;
 
+		if (g_cancel) {
+			ok = -1;
+			goto out;
+		}
 		if (read_exact(req, &ch, 1) != 0) {
 			ok = 0;
 			break;
@@ -1174,10 +1216,12 @@ static DWORD WINAPI net_thread(LPVOID param)
 		int need = 0;
 		int rc;
 
+		if (g_cancel)
+			break;
 		rc = do_round(job->hwnd, body, &tl, &need);
 		free(body);
 		body = NULL;
-		if (rc != 0) {
+		if (rc != 0 || g_cancel) {
 			free_tool_list(&tl);
 			break;
 		}
@@ -1189,13 +1233,26 @@ static DWORD WINAPI net_thread(LPVOID param)
 		free_tool_list(&tl);
 		if (!body)
 			break;
+		if (g_cancel) {
+			free(body);
+			body = NULL;
+			break;
+		}
 	}
+	if (g_cancel)
+		PostMessageA(job->hwnd, WM_APP_LOG, 0, (LPARAM)dupstr("\r\n[stopped]\r\n"));
 	if (body && round >= MAX_TOOL_ROUNDS)
 		post_error(job->hwnd, "tool loop limit reached");
 	free(body);
 	PostMessageA(job->hwnd, WM_APP_DONE, 0, 0);
 	free(job);
 	return 0;
+}
+
+static void do_stop(void)
+{
+	InterlockedExchange(&g_cancel, 1);
+	set_status("Stopping...");
 }
 
 static void do_send(void)
@@ -1213,7 +1270,10 @@ static void do_send(void)
 		return;
 	}
 	g_busy = 1;
+	InterlockedExchange(&g_cancel, 0);
 	EnableWindow(g_send, FALSE);
+	if (g_stop)
+		EnableWindow(g_stop, TRUE);
 	SetWindowTextA(g_input, "");
 	transcript_append_styled("You: ", RGB(0, 0, 180), 1);
 	transcript_append(text);
@@ -1454,6 +1514,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 					 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
 					 0, 0, 10, 10, hwnd, (HMENU)IDC_SEND,
 					 GetModuleHandle(NULL), NULL);
+		g_stop = CreateWindowExA(0, "BUTTON", "Stop",
+					 WS_CHILD | WS_VISIBLE,
+					 0, 0, 10, 10, hwnd, (HMENU)IDC_STOP,
+					 GetModuleHandle(NULL), NULL);
+		if (g_stop)
+			EnableWindow(g_stop, FALSE);
 		g_status = CreateWindowExA(0, "STATIC", "Ready (Ctrl+Enter sends)",
 					   WS_CHILD | WS_VISIBLE | SS_LEFT,
 					   0, 0, 10, 10, hwnd, (HMENU)IDC_STATUS,
@@ -1462,6 +1528,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 			SendMessageA(g_transcript, WM_SETFONT, (WPARAM)g_font, TRUE);
 			SendMessageA(g_input, WM_SETFONT, (WPARAM)g_font, TRUE);
 			SendMessageA(g_send, WM_SETFONT, (WPARAM)g_font, TRUE);
+			SendMessageA(g_stop, WM_SETFONT, (WPARAM)g_font, TRUE);
 			SendMessageA(g_status, WM_SETFONT, (WPARAM)g_font, TRUE);
 		}
 		g_edit_proc = (WNDPROC)SetWindowLongPtrA(g_input, GWLP_WNDPROC,
@@ -1472,15 +1539,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		int h = HIWORD(lParam);
 		int margin = 8;
 		int input_h = 64;
-		int btn_w = 74;
+		int send_w = 74;
+		int stop_w = 60;
 		int status_h = 20;
 
 		MoveWindow(g_transcript, margin, margin, w - 2 * margin,
 			   h - 2 * margin - input_h - status_h - 8, TRUE);
 		MoveWindow(g_input, margin, h - margin - status_h - input_h,
-			   w - 2 * margin - btn_w - 8, input_h, TRUE);
-		MoveWindow(g_send, w - margin - btn_w,
-			   h - margin - status_h - 26, btn_w, 26, TRUE);
+			   w - 2 * margin - send_w - stop_w - 8, input_h, TRUE);
+		MoveWindow(g_send, w - margin - send_w,
+			   h - margin - status_h - 26, send_w, 26, TRUE);
+		MoveWindow(g_stop, w - margin - send_w - stop_w - 4,
+			   h - margin - status_h - 26, stop_w, 26, TRUE);
 		MoveWindow(g_status, margin, h - margin - status_h + 2,
 			   w - 2 * margin, status_h, TRUE);
 		return 0;
@@ -1495,6 +1565,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		switch (LOWORD(wParam)) {
 		case IDC_SEND:
 			do_send();
+			return 0;
+		case IDC_STOP:
+			do_stop();
 			return 0;
 		case IDM_NEW:
 			new_chat();
@@ -1563,6 +1636,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		return 0;
 	}
 	case WM_APP_DONE:
+		InterlockedExchange(&g_cancel, 0);
+		EnableWindow(g_stop, FALSE);
 		if (g_reply.p) {
 			log_append("XPCode: ");
 			log_append(g_reply.p);
@@ -1587,7 +1662,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	WNDCLASSA wc;
 	MSG msg;
 	RECT wa;
-	ACCEL acc[3];
+	ACCEL acc[4];
 	HACCEL accel;
 	int ww = 760, wh = 560, wx, wy;
 
@@ -1638,7 +1713,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	acc[2].fVirt = FVIRTKEY | FCONTROL;
 	acc[2].key = VK_OEM_COMMA;
 	acc[2].cmd = IDM_SETTINGS;
-	accel = CreateAcceleratorTableA(acc, 3);
+	acc[3].fVirt = FVIRTKEY;
+	acc[3].key = VK_ESCAPE;
+	acc[3].cmd = IDC_STOP;
+	accel = CreateAcceleratorTableA(acc, 4);
 
 	while (GetMessageA(&msg, NULL, 0, 0) > 0) {
 		if (!TranslateAcceleratorA(g_hwnd, accel, &msg)) {
