@@ -202,15 +202,39 @@ static void load_settings(void)
 static char *get_input_text(void)
 {
 	int n = GetWindowTextLengthA(g_input);
-	char *s = (char *)malloc((size_t)n + 1);
+	char *a, *u;
+	wchar_t *w;
+	int wl, ul;
 
-	if (!s)
+	a = (char *)malloc((size_t)n + 1);
+	if (!a)
 		return NULL;
 	if (n > 0)
-		GetWindowTextA(g_input, s, n + 1);
+		GetWindowTextA(g_input, a, n + 1);
 	else
-		s[0] = 0;
-	return s;
+		a[0] = 0;
+	wl = MultiByteToWideChar(CP_ACP, 0, a, -1, NULL, 0);
+	if (wl <= 0) {
+		free(a);
+		return dupstr("");
+	}
+	w = (wchar_t *)malloc((size_t)wl * sizeof(wchar_t));
+	if (!w) {
+		free(a);
+		return NULL;
+	}
+	MultiByteToWideChar(CP_ACP, 0, a, -1, w, wl);
+	ul = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+	u = (char *)malloc((size_t)(ul > 0 ? ul : 1));
+	if (u) {
+		if (ul > 0)
+			WideCharToMultiByte(CP_UTF8, 0, w, -1, u, ul, NULL, NULL);
+		else
+			u[0] = 0;
+	}
+	free(w);
+	free(a);
+	return u;
 }
 
 static void set_status(const char *s)
@@ -220,14 +244,26 @@ static void set_status(const char *s)
 
 static void transcript_append(const char *s)
 {
-	int len;
+	int wl, len;
+	wchar_t *w;
 
-	SendMessageA(g_transcript, EM_SETREADONLY, FALSE, 0);
-	len = GetWindowTextLengthA(g_transcript);
-	SendMessageA(g_transcript, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-	SendMessageA(g_transcript, EM_REPLACESEL, FALSE, (LPARAM)s);
-	SendMessageA(g_transcript, EM_SCROLLCARET, 0, 0);
-	SendMessageA(g_transcript, EM_SETREADONLY, TRUE, 0);
+	if (!s)
+		return;
+	wl = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+	if (wl <= 0)
+		return;
+	w = (wchar_t *)malloc((size_t)wl * sizeof(wchar_t));
+	if (!w)
+		return;
+	MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wl);
+
+	SendMessageW(g_transcript, EM_SETREADONLY, FALSE, 0);
+	len = GetWindowTextLengthW(g_transcript);
+	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+	SendMessageW(g_transcript, EM_REPLACESEL, FALSE, (LPARAM)w);
+	SendMessageW(g_transcript, EM_SCROLLCARET, 0, 0);
+	SendMessageW(g_transcript, EM_SETREADONLY, TRUE, 0);
+	free(w);
 }
 
 static int read_exact(HINTERNET h, char *buf, DWORD n)
@@ -1139,7 +1175,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		g_font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
 				     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
 				     DEFAULT_PITCH | FF_SWISS, "Tahoma");
-		g_transcript = CreateWindowExA(WS_EX_CLIENTEDGE, "RichEdit20A", "",
+		g_transcript = CreateWindowExA(WS_EX_CLIENTEDGE, "RichEdit20W", "",
 					       WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
 					       ES_READONLY | ES_AUTOVSCROLL | ES_NOHIDESEL,
 					       0, 0, 10, 10, hwnd, (HMENU)IDC_TRANSCRIPT,
