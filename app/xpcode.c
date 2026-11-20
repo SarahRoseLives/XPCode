@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #define WM_APP_DONE (WM_APP + 2)
 #define WM_APP_ERROR (WM_APP + 3)
 #define WM_APP_LOG (WM_APP + 4)
+#define WM_APP_STATUS (WM_APP + 5)
 
 #define MAX_FRAME (64L * 1024 * 1024)
 #define MAX_TOOL_ROUNDS 8
@@ -458,7 +460,7 @@ static char *tool_list_dir(const char *path)
 	return b.p;
 }
 
-static char *tool_run_command(const char *command)
+static char *tool_run_command(const char *command, int timeout_sec)
 {
 	char tmpdir[MAX_PATH], bat[MAX_PATH * 2], outp[MAX_PATH * 2];
 	DWORD tick = GetTickCount();
@@ -467,6 +469,8 @@ static char *tool_run_command(const char *command)
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	DWORD wrote = 0, code = 0, size = 0, off = 0, got = 0;
+	DWORD wait;
+	int timed_out;
 	char *body = NULL;
 	SB b = {0};
 	char head[64];
@@ -524,7 +528,12 @@ static char *tool_run_command(const char *command)
 	CloseHandle(hout);
 	if (nul != INVALID_HANDLE_VALUE)
 		CloseHandle(nul);
-	WaitForSingleObject(pi.hProcess, INFINITE);
+	wait = WaitForSingleObject(pi.hProcess, (DWORD)timeout_sec * 1000);
+	timed_out = (wait == WAIT_TIMEOUT);
+	if (timed_out) {
+		TerminateProcess(pi.hProcess, 1);
+		WaitForSingleObject(pi.hProcess, 5000);
+	}
 	GetExitCodeProcess(pi.hProcess, &code);
 	CloseHandle(pi.hThread);
 	CloseHandle(pi.hProcess);
@@ -552,8 +561,26 @@ static char *tool_run_command(const char *command)
 	sprintf(head, "exit=%lu\r\n", (unsigned long)code);
 	sb_str(&b, head);
 	sb_str(&b, body ? body : "");
+	if (timed_out) {
+		char note[64];
+		sprintf(note, "\r\n[timed out after %d s]", timeout_sec);
+		sb_str(&b, note);
+	}
 	free(body);
 	return b.p ? b.p : dupstr("");
+}
+
+static char *tool_make_dir(const char *path)
+{
+	int r = SHCreateDirectoryExA(NULL, path, NULL);
+
+	if (r == ERROR_SUCCESS || r == ERROR_ALREADY_EXISTS || r == ERROR_FILE_EXISTS)
+		return dupstr("ok");
+	{
+		char m[128];
+		sprintf(m, "error: cannot create directory (%d)", r);
+		return dupstr(m);
+	}
 }
 
 static void resolve_path(const char *in, char *out, size_t cap)
@@ -623,7 +650,7 @@ static void search_file(const char *path, const char *pattern, int max, SB *out,
 	p = buf;
 	while (p && *p && *count < max) {
 		char *nl = strchr(p, '\n');
-		char linebuf[1400];
+		char linebuf[1800];
 		if (nl)
 			*nl = 0;
 		if (strstr(p, pattern)) {
@@ -787,6 +814,10 @@ static char *execute_tool(ToolCall *tc)
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
 		return tool_edit_file(path, arg_of(tc, "old"), arg_of(tc, "new"), do_all);
 	}
+	if (!strcmp(tc->name, "make_dir")) {
+		resolve_path(arg_of(tc, "path"), path, sizeof path);
+		return tool_make_dir(path);
+	}
 	if (!strcmp(tc->name, "list_dir")) {
 		resolve_path(arg_of(tc, "path"), path, sizeof path);
 		return tool_list_dir(path);
@@ -800,8 +831,15 @@ static char *execute_tool(ToolCall *tc)
 			max = 500;
 		return tool_search(arg_of(tc, "pattern"), arg_of(tc, "path"), max);
 	}
-	if (!strcmp(tc->name, "run_command"))
-		return tool_run_command(arg_of(tc, "command"));
+	if (!strcmp(tc->name, "run_command")) {
+		const char *ts = arg_of(tc, "timeout");
+		int sec = *ts ? atoi(ts) : 120;
+		if (sec < 1)
+			sec = 1;
+		if (sec > 600)
+			sec = 600;
+		return tool_run_command(arg_of(tc, "command"), sec);
+	}
 	return dupstr("error: unknown tool");
 }
 
@@ -826,6 +864,7 @@ static char *execute_and_build(ToolList *tl, HWND hwnd)
 	SB b = {0};
 	int i;
 
+	PostMessageA(hwnd, WM_APP_STATUS, 0, (LPARAM)dupstr("Running tools..."));
 	sb_str(&b, "{\"session\":");
 	sb_json(&b, g_session);
 	sb_str(&b, ",\"model\":");
@@ -857,6 +896,7 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 	int ok = -1;
 
 	*need_tools = 0;
+	PostMessageA(hwnd, WM_APP_STATUS, 0, (LPARAM)dupstr("Thinking..."));
 	inet = InternetOpenA("XPCode/0.2", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
 	if (!inet) {
 		post_wininet_error(hwnd, "InternetOpen failed");
@@ -1193,6 +1233,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 			free(s);
 		}
 		set_status("Error");
+		return 0;
+	}
+	case WM_APP_STATUS: {
+		char *s = (char *)lParam;
+		if (s) {
+			set_status(s);
+			free(s);
+		}
 		return 0;
 	}
 	case WM_APP_DONE:

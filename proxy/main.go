@@ -152,6 +152,15 @@ func toolDefs() []map[string]any {
 			},
 		}},
 		{"type": "function", "function": map[string]any{
+			"name":        "make_dir",
+			"description": "Create a directory (and any missing parents) on the XP machine.",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"path": str("Directory relative to the project root, or absolute")},
+				"required":   []string{"path"},
+			},
+		}},
+		{"type": "function", "function": map[string]any{
 			"name":        "list_dir",
 			"description": "List a directory on the XP machine.",
 			"parameters": map[string]any{
@@ -164,9 +173,12 @@ func toolDefs() []map[string]any {
 			"name":        "run_command",
 			"description": "Run a shell command on the XP machine and return its output.",
 			"parameters": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"command": str("Command line")},
-				"required":   []string{"command"},
+				"type": "object",
+				"properties": map[string]any{
+					"command": str("Command line"),
+					"timeout": map[string]any{"type": "integer", "description": "Seconds before killing the command (default 120)"},
+				},
+				"required": []string{"command"},
 			},
 		}},
 	}
