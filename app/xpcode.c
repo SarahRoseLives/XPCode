@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <richedit.h>
+#include <objbase.h>
 #include "resource.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,9 +32,10 @@
 #define WM_APP_ERROR (WM_APP + 3)
 #define WM_APP_LOG (WM_APP + 4)
 #define WM_APP_STATUS (WM_APP + 5)
+#define WM_APP_REASON (WM_APP + 6)
 
 #define MAX_FRAME (64L * 1024 * 1024)
-#define MAX_TOOL_ROUNDS 8
+#define MAX_TOOL_ROUNDS 40
 
 typedef struct {
 	char *p;
@@ -78,12 +80,13 @@ static HWND g_status;
 static HFONT g_font;
 static WNDPROC g_edit_proc;
 static int g_busy;
+static int g_reason_started;
 static volatile LONG g_cancel;
 static int g_approve;
 static SB g_reply;
 static char g_host[128] = "Garden.lan";
 static int g_port = 8080;
-static char g_model[128] = "deepseek-chat";
+static char g_model[128] = "deepseek-flash";
 static char g_workdir[MAX_PATH];
 static char g_session[64];
 
@@ -285,12 +288,12 @@ static void load_settings(void)
 	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
 		WritePrivateProfileStringA("server", "host", "Garden.lan", path);
 		WritePrivateProfileStringA("server", "port", "8080", path);
-		WritePrivateProfileStringA("server", "model", "deepseek-chat", path);
+		WritePrivateProfileStringA("server", "model", "deepseek-flash", path);
 		WritePrivateProfileStringA("server", "workdir", exe_dir, path);
 		WritePrivateProfileStringA("server", "approve", "0", path);
 	}
 	GetPrivateProfileStringA("server", "host", "Garden.lan", g_host, sizeof g_host, path);
-	GetPrivateProfileStringA("server", "model", "deepseek-chat", g_model, sizeof g_model, path);
+	GetPrivateProfileStringA("server", "model", "deepseek-flash", g_model, sizeof g_model, path);
 	GetPrivateProfileStringA("server", "workdir", exe_dir, g_workdir, sizeof g_workdir, path);
 	if (GetFileAttributesA(g_workdir) == INVALID_FILE_ATTRIBUTES)
 		strcpy(g_workdir, exe_dir);
@@ -341,7 +344,7 @@ static void set_status(const char *s)
 	SetWindowTextA(g_status, s);
 }
 
-static void transcript_append_styled(const char *s, COLORREF color, int bold)
+static void transcript_append_styled(const char *s, COLORREF color, int bold, int italic)
 {
 	int wl, start, end;
 	wchar_t *w;
@@ -366,9 +369,9 @@ static void transcript_append_styled(const char *s, COLORREF color, int bold)
 
 	memset(&cf, 0, sizeof cf);
 	cf.cbSize = sizeof cf;
-	cf.dwMask = CFM_COLOR | CFM_BOLD;
+	cf.dwMask = CFM_COLOR | CFM_BOLD | CFM_ITALIC;
 	cf.crTextColor = color;
-	cf.dwEffects = bold ? CFE_BOLD : 0;
+	cf.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0);
 	SendMessageW(g_transcript, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
 
 	SendMessageW(g_transcript, EM_SETSEL, (WPARAM)end, (LPARAM)end);
@@ -379,7 +382,7 @@ static void transcript_append_styled(const char *s, COLORREF color, int bold)
 
 static void transcript_append(const char *s)
 {
-	transcript_append_styled(s, RGB(0, 0, 0), 0);
+	transcript_append_styled(s, RGB(0, 0, 0), 0, 0);
 }
 
 static int read_exact(HINTERNET h, char *buf, DWORD n)
@@ -1501,6 +1504,8 @@ static int do_round(HWND hwnd, const char *body, ToolList *tl, int *need_tools)
 		data[n] = 0;
 		if (type == 'D') {
 			PostMessageA(hwnd, WM_APP_CHUNK, 0, (LPARAM)data);
+		} else if (type == 'R') {
+			PostMessageA(hwnd, WM_APP_REASON, 0, (LPARAM)data);
 		} else if (type == 'E') {
 			PostMessageA(hwnd, WM_APP_ERROR, 0, (LPARAM)data);
 		} else if (type == 'T') {
@@ -1582,6 +1587,8 @@ static DWORD WINAPI net_thread(LPVOID param)
 
 static void do_stop(void)
 {
+	if (!g_busy)
+		return;
 	InterlockedExchange(&g_cancel, 1);
 	set_status("Stopping...");
 }
@@ -1602,17 +1609,18 @@ static void do_send(void)
 	}
 	g_busy = 1;
 	InterlockedExchange(&g_cancel, 0);
+	g_reason_started = 0;
 	EnableWindow(g_send, FALSE);
 	if (g_stop)
 		EnableWindow(g_stop, TRUE);
 	SetWindowTextA(g_input, "");
-	transcript_append_styled("You: ", RGB(0, 0, 180), 1);
+	transcript_append_styled("You: ", RGB(0, 0, 180), 1, 0);
 	transcript_append(text);
 	log_append("You: ");
 	log_append(text);
 	log_append("\r\n");
 	transcript_append("\r\n\r\n");
-	transcript_append_styled("XPCode: ", RGB(0, 128, 0), 1);
+	transcript_append_styled("XPCode: ", RGB(0, 128, 0), 1, 0);
 	sb_free(&g_reply);
 	body = build_start_body(text);
 	set_status("Thinking...");
@@ -1694,6 +1702,21 @@ static void open_settings_file(void)
 	ShellExecuteA(g_hwnd, "open", "notepad.exe", path, NULL, SW_SHOW);
 }
 
+static void new_session_id(void)
+{
+	GUID g;
+
+	if (CoCreateGuid(&g) == S_OK) {
+		sprintf(g_session, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+			(unsigned long)g.Data1, g.Data2, g.Data3,
+			g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+			g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+	} else {
+		sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
+			(unsigned long)GetTickCount());
+	}
+}
+
 static void update_title(void)
 {
 	char title[MAX_PATH + 16];
@@ -1708,8 +1731,7 @@ static void new_chat(void)
 		return;
 	SetWindowTextW(g_transcript, L"");
 	sb_free(&g_reply);
-	sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
-		(unsigned long)GetTickCount());
+	new_session_id();
 	log_append("\r\n=== new chat ===\r\n");
 	set_status("New chat");
 	SetFocus(g_input);
@@ -1793,7 +1815,7 @@ static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM 
 			WritePrivateProfileStringA("server", "host", host[0] ? host : "Garden.lan", ini);
 			sprintf(port, "%d", p);
 			WritePrivateProfileStringA("server", "port", port, ini);
-			WritePrivateProfileStringA("server", "model", model[0] ? model : "deepseek-chat", ini);
+			WritePrivateProfileStringA("server", "model", model[0] ? model : "deepseek-flash", ini);
 			WritePrivateProfileStringA("server", "workdir", work[0] ? work : g_workdir, ini);
 			WritePrivateProfileStringA("server", "approve", g_approve ? "1" : "0", ini);
 			EndDialog(dlg, 1);
@@ -1938,10 +1960,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		}
 		return 0;
 	}
+	case WM_APP_REASON: {
+		char *s = (char *)lParam;
+		if (s) {
+			if (!g_reason_started) {
+				transcript_append_styled("\r\n[thinking]\r\n", RGB(130, 130, 130), 1, 0);
+				g_reason_started = 1;
+			}
+			transcript_append_styled(s, RGB(130, 130, 130), 0, 1);
+			free(s);
+		}
+		return 0;
+	}
 	case WM_APP_LOG: {
 		char *s = (char *)lParam;
 		if (s) {
-			transcript_append_styled(s, RGB(110, 110, 110), 0);
+			transcript_append_styled(s, RGB(0, 110, 130), 1, 0);
 			log_append(s);
 			free(s);
 		}
@@ -1953,9 +1987,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		if (s)
 			log_append(s);
 		log_append("\r\n");
-		transcript_append_styled("\r\n[error] ", RGB(180, 0, 0), 1);
+		transcript_append_styled("\r\n[error] ", RGB(180, 0, 0), 1, 0);
 		if (s) {
-			transcript_append_styled(s, RGB(180, 0, 0), 0);
+			transcript_append_styled(s, RGB(180, 0, 0), 0, 0);
 			free(s);
 		}
 		set_status("Error");
@@ -2004,8 +2038,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	(void)show;
 
 	load_settings();
-	sprintf(g_session, "xp-%lu-%lu", (unsigned long)GetCurrentProcessId(),
-		(unsigned long)GetTickCount());
+	new_session_id();
 
 	memset(&wc, 0, sizeof wc);
 	wc.lpfnWndProc = wnd_proc;

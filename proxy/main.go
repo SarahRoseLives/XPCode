@@ -34,10 +34,11 @@ type oaiMessage struct {
 }
 
 type upstreamRequest struct {
-	Model    string           `json:"model"`
-	Messages []oaiMessage     `json:"messages"`
-	Stream   bool             `json:"stream"`
-	Tools    []map[string]any `json:"tools,omitempty"`
+	Model     string           `json:"model"`
+	Messages  []oaiMessage     `json:"messages"`
+	Stream    bool             `json:"stream"`
+	Tools     []map[string]any `json:"tools,omitempty"`
+	MaxTokens int              `json:"max_tokens,omitempty"`
 }
 
 type clientRequest struct {
@@ -57,8 +58,9 @@ type toolResult struct {
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Function struct {
@@ -67,6 +69,7 @@ type streamChunk struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -88,10 +91,10 @@ var (
 	apiKey     = flag.String("api-key", "", "API key (defaults to DEEPSEEK_API_KEY or OPENAI_API_KEY)")
 	apiKeyFile = flag.String("api-key-file", "", "read the API key from this file")
 	modelFlag  = flag.String("model", "", "force this model for every request")
-	systemFlag = flag.String("system", "You are XPCode, a coding agent running inside Windows XP. You can inspect files and run commands on this machine through tools.\n\nWork like a careful engineer:\n- Inspect before changing: use list_dir, glob, search, and read_file.\n- Prefer small, focused edits with edit_file or apply_patch; do not rewrite files blindly.\n- After changing code, run a build or test command when one is available.\n- Keep replies short; say what you changed and how you verified it.\n- Use paths relative to the project root unless an absolute path is needed.", "system prompt added when the client sends none (empty disables)")
+	systemFlag = flag.String("system", "You are XPCode, a coding agent running inside Windows XP. You can inspect files and run commands on this machine through tools.\n\nWork like a careful engineer:\n- Inspect before changing: use list_dir, glob, search, and read_file.\n- Prefer small, focused edits with edit_file or apply_patch; do not rewrite files blindly.\n- After changing code, run a build or test command when one is available.\n- Keep replies short; say what you changed and how you verified it.\n- Use paths relative to the project root unless an absolute path is needed.\n- Never shut down, reboot, or format the machine, and avoid destructive commands unless the user explicitly asks for that exact action.", "system prompt added when the client sends none (empty disables)")
 	mockMode   = flag.Bool("mock", false, "stream a canned reply instead of calling the upstream")
 	verbose    = flag.Bool("verbose", false, "log each request and upstream status")
-	defaultMdl = "deepseek-chat"
+	defaultMdl = "deepseek-flash"
 )
 
 var (
@@ -357,10 +360,11 @@ func writeToolFrame(w io.Writer, tc toolCall) {
 
 func upstreamStream(ctx context.Context, w http.ResponseWriter, modelName string, msgs []oaiMessage, key string) (string, []toolCall, error) {
 	body, err := json.Marshal(upstreamRequest{
-		Model:    modelName,
-		Messages: msgs,
-		Stream:   true,
-		Tools:    toolDefs(),
+		Model:     modelName,
+		Messages:  msgs,
+		Stream:    true,
+		Tools:     toolDefs(),
+		MaxTokens: 16384,
 	})
 	if err != nil {
 		return "", nil, err
@@ -387,6 +391,8 @@ func upstreamStream(ctx context.Context, w http.ResponseWriter, modelName string
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var text strings.Builder
 	acc := map[int]*toolCall{}
+	reasoningLen := 0
+	finish := ""
 	for sc.Scan() {
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data:") {
@@ -404,10 +410,18 @@ func upstreamStream(ctx context.Context, w http.ResponseWriter, modelName string
 			continue
 		}
 		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent != "" {
+			reasoningLen += len(delta.ReasoningContent)
+			writeFrame(w, 'R', []byte(delta.ReasoningContent))
+			flushWriter(w)
+		}
 		if delta.Content != "" {
 			text.WriteString(delta.Content)
 			writeFrame(w, 'D', []byte(delta.Content))
 			flushWriter(w)
+		}
+		if chunk.Choices[0].FinishReason != nil {
+			finish = *chunk.Choices[0].FinishReason
 		}
 		for _, tc := range delta.ToolCalls {
 			a := acc[tc.Index]
@@ -426,6 +440,9 @@ func upstreamStream(ctx context.Context, w http.ResponseWriter, modelName string
 	}
 	if err := sc.Err(); err != nil {
 		return text.String(), nil, err
+	}
+	if *verbose {
+		log.Printf("upstream done finish=%q content=%d reasoning=%d", finish, text.Len(), reasoningLen)
 	}
 	idx := make([]int, 0, len(acc))
 	for k := range acc {
@@ -538,6 +555,14 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 
 	text, tcs, err := upstreamStream(r.Context(), w, modelName, s.messages, key)
 	if err != nil {
+		if r.Context().Err() != nil {
+			if *verbose {
+				log.Printf("session=%s canceled", req.Session)
+			}
+			writeFrame(w, 'Z', nil)
+			flushWriter(w)
+			return
+		}
 		errText := "error: " + err.Error()
 		writeFrame(w, 'E', []byte(err.Error()))
 		s.messages = append(s.messages, oaiMessage{Role: "assistant", Content: &errText})
