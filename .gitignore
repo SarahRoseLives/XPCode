@@ -1,0 +1,17 @@
+AGENTS.md
+build/
+dist/
+target/
+out/
+node_modules/
+
+app/*.exe
+guest/*.exe
+*.iso
+*.pyc
+__pycache__/
+
+.env
+api_key
+*.key
+secrets*

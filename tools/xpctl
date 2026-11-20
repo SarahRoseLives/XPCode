@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+
+VM = os.environ.get("XPCODE_VM", "XPCode")
+AGENT_HOST = os.environ.get("XPAGENT_HOST", "127.0.0.1")
+AGENT_PORT = int(os.environ.get("XPAGENT_PORT", "4444"))
+VBOX = os.environ.get("VBOXMANAGE", "VBoxManage")
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+GUEST_DIR = os.path.join(ROOT, "guest")
+
+
+def vbm_run(args, check=True):
+    r = subprocess.run([VBOX, *args])
+    if check and r.returncode != 0:
+        raise SystemExit(r.returncode)
+    return r.returncode
+
+
+def vbm_out(args):
+    r = subprocess.run([VBOX, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        raise SystemExit(r.returncode)
+    return r.stdout
+
+
+def vm_running():
+    try:
+        out = vbm_out(["list", "runningvms"])
+    except SystemExit:
+        return False
+    return any(line.split()[0].strip('"') == VM for line in out.splitlines() if line.strip())
+
+
+def _send_frame(sock, verb, fields):
+    out = [f"{verb} {len(fields)}\n".encode()]
+    for f in fields:
+        if isinstance(f, str):
+            f = f.encode()
+        out.append(f"{len(f)}\n".encode())
+        out.append(f)
+    sock.sendall(b"".join(out))
+
+
+def _recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("agent closed the connection")
+        buf += chunk
+    return bytes(buf)
+
+
+def _recv_line(sock):
+    buf = bytearray()
+    while True:
+        c = sock.recv(1)
+        if not c:
+            raise ConnectionError("agent closed the connection")
+        if c == b"\n":
+            if buf.endswith(b"\r"):
+                buf = buf[:-1]
+            return buf.decode()
+        buf += c
+
+
+def _recv_resp(sock):
+    status, n = _recv_line(sock).split(" ", 1)
+    fields = []
+    for _ in range(int(n)):
+        ln = int(_recv_line(sock))
+        fields.append(_recv_exact(sock, ln) if ln else b"")
+    return status, fields
+
+
+def agent_call(verb, fields=(), timeout=60):
+    try:
+        sock = socket.create_connection((AGENT_HOST, AGENT_PORT), timeout=5)
+    except OSError as e:
+        sys.stderr.write(
+            f"xpctl: cannot reach agent at {AGENT_HOST}:{AGENT_PORT} ({e}).\n"
+            "Is xpagent.exe running in the guest and the NAT rule set up (`xpctl nat`)?\n"
+        )
+        raise SystemExit(1)
+    try:
+        sock.settimeout(timeout)
+        _send_frame(sock, verb, fields)
+        return _recv_resp(sock)
+    except socket.timeout:
+        sys.stderr.write("xpctl: agent timed out\n")
+        raise SystemExit(1)
+    finally:
+        sock.close()
+
+
+def bmp_to_png(bmp):
+    if bmp[:2] != b"BM":
+        raise ValueError("guest did not return a BMP")
+    off = struct.unpack_from("<I", bmp, 10)[0]
+    w = struct.unpack_from("<i", bmp, 18)[0]
+    h = struct.unpack_from("<i", bmp, 22)[0]
+    bpp = struct.unpack_from("<H", bmp, 28)[0]
+    comp = struct.unpack_from("<I", bmp, 30)[0]
+    if comp != 0 or bpp not in (24, 32):
+        raise ValueError(f"unsupported BMP bpp={bpp} comp={comp}")
+    topdown = h < 0
+    h = abs(h)
+    stride = ((w * bpp + 31) // 32) * 4
+    raw = bytearray()
+    for y in range(h):
+        row = off + (y if topdown else h - 1 - y) * stride
+        line = bmp[row:row + w * (bpp // 8)]
+        raw.append(0)
+        rgb = bytearray(w * 3)
+        if bpp == 32:
+            rgb[0::3] = line[2::4]
+            rgb[1::3] = line[1::4]
+            rgb[2::3] = line[0::4]
+        else:
+            rgb[0::3] = line[2::3]
+            rgb[1::3] = line[1::3]
+            rgb[2::3] = line[0::3]
+        raw += rgb
+
+    def chunk(typ, data):
+        return (
+            struct.pack(">I", len(data))
+            + typ
+            + data
+            + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def fail(msg):
+    sys.stderr.write(f"xpctl: {msg}\n")
+    raise SystemExit(1)
+
+
+def cmd_start(a):
+    vbm_run(["startvm", VM, "--type", "headless" if a.headless else "gui"])
+
+
+def cmd_stop(a):
+    vbm_run(["controlvm", VM, "poweroff" if a.force else "acpipowerbutton"])
+
+
+def cmd_savestate(a):
+    vbm_run(["controlvm", VM, "savestate"])
+
+
+def cmd_snap(a):
+    name = a.name or time.strftime("snap-%Y%m%d-%H%M%S")
+    vbm_run(["snapshot", VM, "take", name])
+    print(name)
+
+
+def cmd_restore(a):
+    vbm_run(["snapshot", VM, "restore", a.name])
+
+
+def cmd_snaps(a):
+    sys.stdout.write(vbm_out(["snapshot", VM, "list", "--machinereadable"]))
+
+
+def cmd_nat(a):
+    rule = f"xpagent,tcp,127.0.0.1,{a.host_port},,{a.guest_port}"
+    if vm_running():
+        vbm_run(["controlvm", VM, "natpf1", rule], check=False)
+    else:
+        vbm_run(["modifyvm", VM, "--natpf1", rule], check=False)
+    print(rule)
+
+
+def cmd_shot(a):
+    out = a.out or "/tmp/xp.png"
+    vbm_run(["controlvm", VM, "screenshotpng", out])
+    print(out)
+
+
+def cmd_agent_shot(a):
+    status, fields = agent_call("SHOT", timeout=30)
+    if status != "OK":
+        fail(fields[0].decode(errors="replace") if fields else "screenshot failed")
+    out = a.out or "/tmp/xp.png"
+    with open(out, "wb") as fp:
+        fp.write(bmp_to_png(fields[0]))
+    print(out)
+
+
+def cmd_type(a):
+    vbm_run(["controlvm", VM, "keyboardputstring", a.text])
+
+
+def cmd_key(a):
+    vbm_run(["controlvm", VM, "keyboardputscancode", *a.scancodes])
+
+
+def cmd_ping(a):
+    status, fields = agent_call("PING", timeout=10)
+    print(fields[0].decode(errors="replace") if fields else status)
+
+
+def cmd_exec(a):
+    status, fields = agent_call("EXEC", [a.command], timeout=a.timeout)
+    if status != "OK" or len(fields) < 2:
+        fail(fields[0].decode(errors="replace") if fields else "exec failed")
+    out = fields[1]
+    sys.stdout.buffer.write(out)
+    sys.stdout.buffer.flush()
+    raise SystemExit(int(fields[0]))
+
+
+def cmd_put(a):
+    with open(a.local, "rb") as fp:
+        data = fp.read()
+    status, fields = agent_call("PUT", [a.remote, data], timeout=300)
+    if status != "OK":
+        fail(fields[0].decode(errors="replace") if fields else "put failed")
+
+
+def cmd_get(a):
+    status, fields = agent_call("GET", [a.remote], timeout=300)
+    if status != "OK":
+        fail(fields[0].decode(errors="replace") if fields else "get failed")
+    if a.local == "-":
+        sys.stdout.buffer.write(fields[0])
+        sys.stdout.buffer.flush()
+    else:
+        with open(a.local, "wb") as fp:
+            fp.write(fields[0])
+
+
+def cmd_tail(a):
+    status, fields = agent_call("TAIL", [a.path, str(a.bytes)], timeout=60)
+    if status != "OK":
+        fail(fields[0].decode(errors="replace") if fields else "tail failed")
+    sys.stdout.buffer.write(fields[0])
+    sys.stdout.buffer.flush()
+
+
+def cmd_move(a):
+    status, fields = agent_call("MOVE", [str(a.x), str(a.y)])
+    if status != "OK":
+        fail(fields[0].decode(errors="replace") if fields else "move failed")
+
+
+def cmd_click(a):
+    if a.x is not None and a.y is not None:
+        fields = [str(a.x), str(a.y), a.button]
+    else:
+        fields = [a.button]
+    status, out = agent_call("CLICK", fields)
+    if status != "OK":
+        fail(out[0].decode(errors="replace") if out else "click failed")
+
+
+def cmd_keytext(a):
+    status, out = agent_call("KEY", [a.text], timeout=120)
+    if status != "OK":
+        fail(out[0].decode(errors="replace") if out else "key failed")
+
+
+def cmd_build(a):
+    if a.clean:
+        subprocess.run(["make", "-C", GUEST_DIR, "clean"])
+    r = subprocess.run(["make", "-C", GUEST_DIR])
+    raise SystemExit(r.returncode)
+
+
+def cmd_iso(a):
+    exe = os.path.join(GUEST_DIR, "xpagent.exe")
+    if not os.path.exists(exe):
+        fail("guest/xpagent.exe not built (run `xpctl build`)")
+    out = a.out or os.path.join(ROOT, "build", "bootstrap.iso")
+    parent = os.path.dirname(out)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(["cp", exe, os.path.join(tmp, "xpagent.exe")], check=True)
+        with open(os.path.join(tmp, "install.bat"), "w", newline="") as fp:
+            fp.write("@echo off\r\n")
+            fp.write("set SRC=%~d0\\\r\n")
+            fp.write("taskkill /F /IM xpagent.exe >nul 2>&1\r\n")
+            fp.write("tskill xpagent >nul 2>&1\r\n")
+            fp.write("ping -n 2 127.0.0.1 >nul\r\n")
+            fp.write("copy /Y \"%SRC%xpagent.exe\" C:\\xpagent.exe > C:\\xp_install.log 2>&1\r\n")
+            fp.write("netsh firewall add portopening TCP 4444 xpagent >> C:\\xp_install.log 2>&1\r\n")
+            fp.write("C:\\xpagent.exe install >> C:\\xp_install.log 2>&1\r\n")
+            fp.write("start \"\" C:\\xpagent.exe\r\n")
+        with open(os.path.join(tmp, "autorun.inf"), "w", newline="") as fp:
+            fp.write("[autorun]\r\n")
+            fp.write("open=install.bat\r\n")
+            fp.write("icon=xpagent.exe\r\n")
+        subprocess.run(
+            ["xorriso", "-as", "mkisofs", "-o", out, "-J", "-R", tmp], check=True
+        )
+    print(out)
+    print(f"attach: {VBOX} storageattach {VM} --storagectl IDE --port 1 --device 0 "
+          f"--type dvddrive --medium {out}")
+    print("then in the guest run: D:\\install.bat")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="xpctl", description="Control the XPCode Windows XP VM.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="power on the VM (GUI by default)")
+    s.add_argument("--headless", action="store_true", help="run without a window")
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop", help="request shutdown / power off")
+    s.add_argument("--force", action="store_true", help="power off immediately")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("savestate", help="suspend the VM")
+    s.set_defaults(func=cmd_savestate)
+
+    s = sub.add_parser("snap", help="take a snapshot")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_snap)
+
+    s = sub.add_parser("restore", help="restore a snapshot")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_restore)
+
+    s = sub.add_parser("snaps", help="list snapshots")
+    s.set_defaults(func=cmd_snaps)
+
+    s = sub.add_parser("nat", help="add the agent port-forward")
+    s.add_argument("--host-port", type=int, default=AGENT_PORT)
+    s.add_argument("--guest-port", type=int, default=AGENT_PORT)
+    s.set_defaults(func=cmd_nat)
+
+    s = sub.add_parser("shot", help="hypervisor screenshot (PNG)")
+    s.add_argument("out", nargs="?")
+    s.set_defaults(func=cmd_shot)
+
+    s = sub.add_parser("agent-shot", help="in-guest screenshot (PNG)")
+    s.add_argument("out", nargs="?")
+    s.set_defaults(func=cmd_agent_shot)
+
+    s = sub.add_parser("type", help="type text via the hypervisor")
+    s.add_argument("text")
+    s.set_defaults(func=cmd_type)
+
+    s = sub.add_parser("key", help="send raw scancodes via the hypervisor")
+    s.add_argument("scancodes", nargs="+")
+    s.set_defaults(func=cmd_key)
+
+    s = sub.add_parser("ping", help="check the guest agent")
+    s.set_defaults(func=cmd_ping)
+
+    s = sub.add_parser("exec", help="run a command in the guest")
+    s.add_argument("command")
+    s.add_argument("--timeout", type=int, default=120)
+    s.set_defaults(func=cmd_exec)
+
+    s = sub.add_parser("put", help="copy a host file into the guest")
+    s.add_argument("local")
+    s.add_argument("remote")
+    s.set_defaults(func=cmd_put)
+
+    s = sub.add_parser("get", help="copy a guest file to the host")
+    s.add_argument("remote")
+    s.add_argument("local")
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("tail", help="read the tail of a guest file")
+    s.add_argument("path")
+    s.add_argument("--bytes", type=int, default=65536)
+    s.set_defaults(func=cmd_tail)
+
+    s = sub.add_parser("move", help="move the guest mouse")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.set_defaults(func=cmd_move)
+
+    s = sub.add_parser("click", help="click in the guest")
+    s.add_argument("button", nargs="?", default="left",
+                   choices=["left", "right", "middle", "double"])
+    s.add_argument("--x", type=int)
+    s.add_argument("--y", type=int)
+    s.set_defaults(func=cmd_click)
+
+    s = sub.add_parser("keytext", help="type text via the guest agent")
+    s.add_argument("text")
+    s.set_defaults(func=cmd_keytext)
+
+    s = sub.add_parser("build", help="cross-compile the guest agent")
+    s.add_argument("--clean", action="store_true")
+    s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("iso", help="build a bootstrap ISO")
+    s.add_argument("--out")
+    s.set_defaults(func=cmd_iso)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
