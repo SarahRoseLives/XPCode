@@ -1138,7 +1138,8 @@ static void do_send(void)
 
 static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+	if (msg == WM_KEYDOWN && wParam == VK_RETURN &&
+	    (GetKeyState(VK_CONTROL) & 0x8000)) {
 		do_send();
 		return 0;
 	}
@@ -1225,14 +1226,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 					       0, 0, 10, 10, hwnd, (HMENU)IDC_TRANSCRIPT,
 					       GetModuleHandle(NULL), NULL);
 		g_input = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
-					  WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-					  0, 0, 10, 10, hwnd, (HMENU)IDC_INPUT,
+					  WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+					  ES_AUTOVSCROLL, 0, 0, 10, 10, hwnd, (HMENU)IDC_INPUT,
 					  GetModuleHandle(NULL), NULL);
 		g_send = CreateWindowExA(0, "BUTTON", "Send",
 					 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
 					 0, 0, 10, 10, hwnd, (HMENU)IDC_SEND,
 					 GetModuleHandle(NULL), NULL);
-		g_status = CreateWindowExA(0, "STATIC", "Ready",
+		g_status = CreateWindowExA(0, "STATIC", "Ready (Ctrl+Enter sends)",
 					   WS_CHILD | WS_VISIBLE | SS_LEFT,
 					   0, 0, 10, 10, hwnd, (HMENU)IDC_STATUS,
 					   GetModuleHandle(NULL), NULL);
@@ -1249,7 +1250,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
 		int margin = 8;
-		int input_h = 26;
+		int input_h = 64;
 		int btn_w = 74;
 		int status_h = 20;
 
@@ -1258,7 +1259,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		MoveWindow(g_input, margin, h - margin - status_h - input_h,
 			   w - 2 * margin - btn_w - 8, input_h, TRUE);
 		MoveWindow(g_send, w - margin - btn_w,
-			   h - margin - status_h - input_h, btn_w, input_h, TRUE);
+			   h - margin - status_h - 26, btn_w, 26, TRUE);
 		MoveWindow(g_status, margin, h - margin - status_h + 2,
 			   w - 2 * margin, status_h, TRUE);
 		return 0;
@@ -1334,7 +1335,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		sb_free(&g_reply);
 		g_busy = 0;
 		EnableWindow(g_send, TRUE);
-		set_status("Ready");
+		set_status("Ready (Ctrl+Enter sends)");
 		SetFocus(g_input);
 		return 0;
 	case WM_DESTROY:
