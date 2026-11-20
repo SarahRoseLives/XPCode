@@ -59,7 +59,7 @@ tools/xpctl exec 'start "" C:\xpcode.exe'
 
 ## Configuration
 
-`C:\xpcode.ini`:
+`C:\xpcode.ini` (also editable from Settings in the app):
 
 ```ini
 [server]
@@ -69,7 +69,7 @@ model=deepseek-chat
 workdir=C:\xpcode-demo
 ```
 
-Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services. Relative tool paths resolve against `workdir`. In the app, `Ctrl+N` starts a new chat, `Ctrl+O` picks the project folder, and `Ctrl+Enter` sends a multi-line prompt.
+Set `host` to an address the guest can reach. Under VirtualBox NAT, the host's LAN name or IP works; `10.0.2.2` may not reach host services. Relative tool paths resolve against `workdir`. In the app, `Ctrl+N` starts a new chat, `Ctrl+O` picks the project folder, `Ctrl+,` opens Settings, and `Ctrl+Enter` sends a multi-line prompt.
 
 Proxy:
 

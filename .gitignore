@@ -6,6 +6,7 @@ out/
 node_modules/
 
 app/*.exe
+app/*.res
 guest/*.exe
 *.iso
 *.pyc

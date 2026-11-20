@@ -7,6 +7,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <richedit.h>
+#include "resource.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #define IDM_ABOUT 2003
 #define IDM_NEW 2004
 #define IDM_WORKDIR 2005
+#define IDM_SETTINGS_FILE 2006
 
 #define WM_APP_CHUNK (WM_APP + 1)
 #define WM_APP_DONE (WM_APP + 2)
@@ -1181,15 +1183,16 @@ static HMENU build_menu(void)
 	AppendMenuA(file, MF_SEPARATOR, 0, NULL);
 	AppendMenuA(file, MF_STRING, IDM_EXIT, "E&xit");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)file, "&File");
+	AppendMenuA(settings, MF_STRING, IDM_SETTINGS, "&Settings...");
+	AppendMenuA(settings, MF_STRING, IDM_SETTINGS_FILE, "Open Settings &File");
 	AppendMenuA(settings, MF_STRING, IDM_WORKDIR, "Choose &Working Folder...");
-	AppendMenuA(settings, MF_STRING, IDM_SETTINGS, "&Open Settings File");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)settings, "&Settings");
 	AppendMenuA(help, MF_STRING, IDM_ABOUT, "&About");
 	AppendMenuA(menu, MF_POPUP, (UINT_PTR)help, "&Help");
 	return menu;
 }
 
-static void open_settings(void)
+static void open_settings_file(void)
 {
 	char path[MAX_PATH];
 
@@ -1234,6 +1237,86 @@ static void choose_workdir(void)
 		set_status(g_workdir);
 	}
 	ILFree(pidl);
+}
+
+static INT_PTR CALLBACK settings_proc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	(void)lParam;
+	switch (msg) {
+	case WM_INITDIALOG: {
+		char port[16];
+		SetDlgItemTextA(dlg, IDC_SET_HOST, g_host);
+		sprintf(port, "%d", g_port);
+		SetDlgItemTextA(dlg, IDC_SET_PORT, port);
+		SetDlgItemTextA(dlg, IDC_SET_MODEL, g_model);
+		SetDlgItemTextA(dlg, IDC_SET_WORKDIR, g_workdir);
+		return TRUE;
+	}
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+		case IDC_SET_BROWSE: {
+			BROWSEINFOA bi;
+			LPITEMIDLIST pidl;
+			char path[MAX_PATH];
+
+			memset(&bi, 0, sizeof bi);
+			bi.hwndOwner = dlg;
+			bi.lpszTitle = "Choose the XPCode project folder";
+			bi.ulFlags = BIF_RETURNONLYFSDIRS;
+			pidl = SHBrowseForFolderA(&bi);
+			if (pidl) {
+				if (SHGetPathFromIDListA(pidl, path))
+					SetDlgItemTextA(dlg, IDC_SET_WORKDIR, path);
+				ILFree(pidl);
+			}
+			return TRUE;
+		}
+		case IDC_SET_OK: {
+			char host[128], model[128], work[MAX_PATH], port[16];
+			char ini[MAX_PATH];
+			int p;
+
+			GetDlgItemTextA(dlg, IDC_SET_HOST, host, sizeof host);
+			GetDlgItemTextA(dlg, IDC_SET_PORT, port, sizeof port);
+			GetDlgItemTextA(dlg, IDC_SET_MODEL, model, sizeof model);
+			GetDlgItemTextA(dlg, IDC_SET_WORKDIR, work, sizeof work);
+			p = atoi(port);
+			if (p < 1 || p > 65535)
+				p = 8080;
+			get_ini_path(ini);
+			WritePrivateProfileStringA("server", "host", host[0] ? host : "Garden.lan", ini);
+			sprintf(port, "%d", p);
+			WritePrivateProfileStringA("server", "port", port, ini);
+			WritePrivateProfileStringA("server", "model", model[0] ? model : "deepseek-chat", ini);
+			WritePrivateProfileStringA("server", "workdir", work[0] ? work : g_workdir, ini);
+			EndDialog(dlg, 1);
+			return TRUE;
+		}
+		case IDC_SET_CANCEL:
+			EndDialog(dlg, 0);
+			return TRUE;
+		}
+		break;
+	case WM_CLOSE:
+		EndDialog(dlg, 0);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void show_settings(void)
+{
+	INT_PTR r;
+
+	if (g_busy)
+		return;
+	r = DialogBoxParamA(GetModuleHandle(NULL), MAKEINTRESOURCEA(IDD_SETTINGS),
+			    g_hwnd, settings_proc, 0);
+	if (r == 1) {
+		load_settings();
+		new_chat();
+		set_status("Settings saved");
+	}
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1302,14 +1385,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 		case IDM_NEW:
 			new_chat();
 			return 0;
+		case IDM_SETTINGS:
+			show_settings();
+			return 0;
+		case IDM_SETTINGS_FILE:
+			open_settings_file();
+			return 0;
 		case IDM_WORKDIR:
 			choose_workdir();
 			return 0;
 		case IDM_EXIT:
 			DestroyWindow(hwnd);
-			return 0;
-		case IDM_SETTINGS:
-			open_settings();
 			return 0;
 		case IDM_ABOUT:
 			MessageBoxA(hwnd,
@@ -1374,7 +1460,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	WNDCLASSA wc;
 	MSG msg;
 	RECT wa;
-	ACCEL acc[2];
+	ACCEL acc[3];
 	HACCEL accel;
 	int ww = 760, wh = 560, wx, wy;
 
@@ -1421,7 +1507,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
 	acc[1].fVirt = FVIRTKEY | FCONTROL;
 	acc[1].key = 'O';
 	acc[1].cmd = IDM_WORKDIR;
-	accel = CreateAcceleratorTableA(acc, 2);
+	acc[2].fVirt = FVIRTKEY | FCONTROL;
+	acc[2].key = VK_OEM_COMMA;
+	acc[2].cmd = IDM_SETTINGS;
+	accel = CreateAcceleratorTableA(acc, 3);
 
 	while (GetMessageA(&msg, NULL, 0, 0) > 0) {
 		if (!TranslateAcceleratorA(g_hwnd, accel, &msg)) {

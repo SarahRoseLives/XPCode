@@ -1,0 +1,13 @@
+#ifndef XPCODE_RESOURCE_H
+#define XPCODE_RESOURCE_H
+
+#define IDD_SETTINGS 101
+#define IDC_SET_HOST 1101
+#define IDC_SET_PORT 1102
+#define IDC_SET_MODEL 1103
+#define IDC_SET_WORKDIR 1104
+#define IDC_SET_BROWSE 1105
+#define IDC_SET_OK 1
+#define IDC_SET_CANCEL 2
+
+#endif
