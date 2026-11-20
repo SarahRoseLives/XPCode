@@ -2,7 +2,9 @@
 
 A native Windows XP AI coding client. XPCode runs as a plain Win32 app inside Windows XP and talks to modern LLMs through a small Go bridge on the host, which handles TLS and keeps the API key off the XP machine.
 
-![XPCode running on Windows XP](docs/screenshot.png)
+![XPCode on Windows XP](docs/demo.webp)
+
+*The agent at work on Windows XP (2× speed).*
 
 ## How it works
 
